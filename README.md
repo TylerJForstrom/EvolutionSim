@@ -41,3 +41,18 @@ an ecosystem sandbox.
 ```
 
 Then open `http://127.0.0.1:8098/index.html`.
+
+## Train a policy
+
+The `training/` folder contains a headless neural-policy harness. It trains a
+herbivore to find food/water, avoid predators, and account for elevation and
+uphill movement cost.
+
+```powershell
+python training\train_policy.py --episodes 80
+```
+
+The trainer saves:
+
+- `models/herbivore_policy.json`
+- `models/training_history.json`
