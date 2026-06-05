@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Adaptive Ecosystem Lab</title>
+    <meta
+      name="description"
+      content="A browser-based 2D ecosystem simulator with energy flow, nutrient cycles, evolving agents, seasons, disease, and disturbance."
+    />
+    <link rel="stylesheet" href="styles.css?v=20260605f" />
+    <script src="sim.js?v=20260605f" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">ECO</div>
+        <div>
+          <h1>Adaptive Ecosystem Lab</h1>
+          <p id="clockReadout">Year 1, Spring, Day 1</p>
+        </div>
+      </div>
+      <div class="top-actions">
+        <button id="runToggle" class="primary" type="button">Pause</button>
+        <button id="stepOnce" type="button">Step</button>
+        <button id="resetWorld" type="button">Reset</button>
+      </div>
+    </header>
+
+    <main class="dashboard">
+      <section class="world-panel">
+        <div class="panel-head">
+          <div>
+            <h2>World</h2>
+            <p id="systemReadout">Stable</p>
+          </div>
+          <div class="segmented" aria-label="Map overlay">
+            <button class="active" type="button" data-overlay="biome">Biome</button>
+            <button type="button" data-overlay="elevation">Elevation</button>
+            <button type="button" data-overlay="water">Water</button>
+            <button type="button" data-overlay="nutrients">Nutrients</button>
+            <button type="button" data-overlay="temperature">Heat</button>
+            <button type="button" data-overlay="toxicity">Toxicity</button>
+          </div>
+        </div>
+        <div class="canvas-wrap">
+          <canvas id="worldCanvas" aria-label="2D ecosystem world"></canvas>
+        </div>
+        <div class="legend" aria-label="Organism legend">
+          <span><i class="swatch plant"></i>Plants/Trees</span>
+          <span><i class="swatch herbivore"></i>Herbivores</span>
+          <span><i class="swatch predator"></i>Predators</span>
+          <span><i class="swatch decomposer"></i>Decomposers</span>
+          <span><i class="swatch pollinator"></i>Pollinators</span>
+          <span><i class="swatch engineer"></i>Engineers</span>
+        </div>
+      </section>
+
+      <aside class="side-panel">
+        <section class="panel">
+          <div class="panel-head compact">
+            <h2>Controls</h2>
+          </div>
+          <div class="controls">
+            <label>
+              Speed
+              <input id="speedControl" type="range" min="1" max="12" value="4" />
+            </label>
+            <label>
+              Rainfall
+              <input id="rainfallControl" type="range" min="15" max="100" value="58" />
+            </label>
+            <label>
+              Temperature
+              <input id="temperatureControl" type="range" min="-25" max="30" value="0" />
+            </label>
+            <label>
+              Disturbance
+              <input id="disturbanceControl" type="range" min="0" max="100" value="26" />
+            </label>
+          </div>
+          <div class="event-buttons">
+            <button type="button" data-event="drought">Drought</button>
+            <button type="button" data-event="fire">Wildfire</button>
+            <button type="button" data-event="flood">Flood</button>
+            <button type="button" data-event="disease">Disease</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head compact">
+            <h2>Population</h2>
+          </div>
+          <div id="metricGrid" class="metric-grid"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head compact">
+            <h2>Signals</h2>
+          </div>
+          <dl id="signalList" class="signal-list"></dl>
+        </section>
+      </aside>
+
+      <section class="panel chart-panel">
+        <div class="panel-head compact">
+          <h2>Population History</h2>
+        </div>
+        <canvas id="historyCanvas" aria-label="Population history chart"></canvas>
+      </section>
+
+      <section class="panel traits-panel">
+        <div class="panel-head compact">
+          <h2>Evolving Policies</h2>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Group</th>
+                <th>Count</th>
+                <th>Generation</th>
+                <th>Speed</th>
+                <th>Sense</th>
+                <th>Resistance</th>
+                <th>Heat Pref</th>
+                <th>Hunger</th>
+                <th>Thirst</th>
+              </tr>
+            </thead>
+            <tbody id="traitRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel event-panel">
+        <div class="panel-head compact">
+          <h2>Event Log</h2>
+        </div>
+        <div id="eventLog" class="event-log"></div>
+      </section>
+    </main>
+  </body>
+</html>
