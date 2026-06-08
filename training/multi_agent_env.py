@@ -66,11 +66,15 @@ SPECIES_PARAMS: list[dict] = [
     # PREDATOR — attack & assimilation tuned down so prey can survive long
     # enough to LEARN to flee; otherwise predator policy converges to "kill
     # everything" before prey policies converge to "avoid predators" and the
-    # whole system collapses (Red-Queen instability).
+    # whole system collapses (Red-Queen instability). Repro gates loosened
+    # and init pop raised so the predator policy gets enough training samples
+    # per update — at the original numbers it was so data-starved it never
+    # learned, leaving the rest of the species training a fixed-random
+    # opponent (one of the main pathologies of the first run).
     dict(
-        speed=0.65, metabolism=0.16, base_energy=86.0, min_age=90, max_age=1300,
-        repro_energy=220.0, repro_cost=58.0, repro_chance=0.010,
-        eat_rate=0.0, food_energy=0.0, max_count=70, init_count=8,
+        speed=0.65, metabolism=0.16, base_energy=86.0, min_age=70, max_age=1300,
+        repro_energy=180.0, repro_cost=55.0, repro_chance=0.022,
+        eat_rate=0.0, food_energy=0.0, max_count=80, init_count=14,
         attack=0.22, handling_min=22, handling_max=40, capture_radius=1.3,
         assimilation=0.17,
     ),
@@ -173,6 +177,13 @@ class World:
         self._engineered = np.zeros(_MAX_AGENTS)
         self._offspring = np.zeros(_MAX_AGENTS, dtype=np.int32)
         self._predator_threat = np.zeros(_MAX_AGENTS)
+        # Predator "closeness to prey" signal — small dense reward proportional
+        # to proximity to nearest prey, so the predator policy gets a gradient
+        # toward stalking even on ticks where it doesn't successfully kill.
+        # Without this the predator's only food signal is the rare kill event,
+        # and its policy stays effectively random (the main pathology observed
+        # in the first multi-agent training run).
+        self._stalk_closeness = np.zeros(_MAX_AGENTS)
 
         self._make_map()
         self._spawn_initial()
@@ -532,6 +543,7 @@ class World:
         self._engineered[:] = 0.0
         self._offspring[:] = 0
         self._predator_threat[:] = 0.0
+        self._stalk_closeness[:] = 0.0
 
         self._update_environment()
 
@@ -806,15 +818,23 @@ class World:
         dy = qy[None, :] - py[:, None]
         d2 = dx * dx + dy * dy
         within = d2 < cap_r * cap_r
-        # Record prey threat (used by prey reward shaping below).
-        if prey_slots.size:
-            # Threat = closeness of nearest predator within ~6 cells.
-            dx_all = self.x[prey_slots][None, :] - self.x[pred_slots][:, None]
-            dy_all = self.y[prey_slots][None, :] - self.y[pred_slots][:, None]
-            d_all = np.sqrt(dx_all * dx_all + dy_all * dy_all)
-            min_dist = np.min(d_all, axis=0) if pred_slots.size > 0 else np.full(prey_slots.size, 99.0)
-            threat = np.clip(1.0 - min_dist / 6.0, 0.0, 1.0)
-            self._predator_threat[prey_slots] = threat
+        # Compute pairwise pred-prey distance once and reuse for: (1) prey
+        # threat signal, (2) predator stalk-closeness signal, (3) capture
+        # logic below.
+        dx_all = self.x[prey_slots][None, :] - self.x[pred_slots][:, None]
+        dy_all = self.y[prey_slots][None, :] - self.y[pred_slots][:, None]
+        d_all = np.sqrt(dx_all * dx_all + dy_all * dy_all)  # (n_pred, n_prey)
+        # Prey threat = closeness of nearest predator within ~6 cells.
+        min_d_prey = np.min(d_all, axis=0)
+        threat = np.clip(1.0 - min_d_prey / 6.0, 0.0, 1.0)
+        self._predator_threat[prey_slots] = threat
+        # Predator stalk closeness = closeness of nearest prey within ~10
+        # cells. Goes up smoothly as a predator approaches prey, giving the
+        # policy a dense per-tick gradient instead of relying only on rare
+        # kill events.
+        min_d_pred = np.min(d_all, axis=1)
+        stalk = np.clip(1.0 - min_d_pred / 10.0, 0.0, 1.0)
+        self._stalk_closeness[pred_slots] = stalk
         # For each predator, count nearby prey (Holling II saturating term).
         prey_count = within.sum(axis=1)
         attack = p["attack"]
@@ -931,6 +951,7 @@ class World:
         engineered = self._engineered[live]
         offspring = self._offspring[live]
         threat = self._predator_threat[live]
+        stalk = self._stalk_closeness[live]
         hunger = self.hunger[live]
         thirst = self.thirst[live]
         # Small living bonus to stabilize early exploration.
@@ -945,12 +966,15 @@ class World:
             + threat * 1.4
         )
         per_live = base - condition_penalty + offspring * _REPRO_REWARD + drank * 2.5
-        # Species-specific food signal.
+        # Species-specific food signal. Predators get a small dense
+        # closeness-to-prey signal on every tick PLUS the big sparse kill
+        # reward — without the dense term the predator policy has almost no
+        # gradient between kill events and stays effectively random.
         food_signal = np.where(
             (species == HERBIVORE) | (species == ENGINEER), ate * 4.5,
             np.where(species == DECOMPOSER, ate * 5.0,
             np.where(species == POLLINATOR, ate * 5.5,
-            np.where(species == PREDATOR, caught * 14.0, 0.0))),
+            np.where(species == PREDATOR, caught * 14.0 + stalk * 0.35, 0.0))),
         )
         per_live += food_signal
         # Engineer also gets a small bonus for terraforming.

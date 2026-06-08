@@ -30,7 +30,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from multi_agent_env import (  # noqa: E402
-    N_ACTIONS, N_SPECIES, OBS_DIM, SPECIES_NAMES, World, _MAX_AGENTS,
+    N_ACTIONS, N_SPECIES, OBS_DIM, PREDATOR, SPECIES_NAMES, World, _MAX_AGENTS,
 )
 from multi_agent_policy import ActorCritic, TrainConfig  # noqa: E402
 
@@ -222,6 +222,16 @@ def train(args: argparse.Namespace) -> None:
                 final_pop_running[sp] += pops[SPECIES_NAMES[sp]]
 
         # ---- Per-species update.
+        # Predator gets a slower entropy decay because (a) its training task
+        # is the hardest (sparse rewards, mobile targets), and (b) its
+        # population is smallest so it sees the fewest transitions per
+        # update. Without this it converges to a near-uniform policy by the
+        # time the schedule reaches its final beta and never escapes.
+        pred_frac = frac * 0.4  # predator entropy decays at 40% of nominal rate
+        pred_entropy_beta = (
+            train_cfg.entropy_beta_init * (1.0 - pred_frac)
+            + train_cfg.entropy_beta_final * pred_frac
+        )
         update_metrics = {}
         for sp in range(N_SPECIES):
             if not species_obs[sp]:
@@ -230,7 +240,8 @@ def train(args: argparse.Namespace) -> None:
             obs = np.concatenate(species_obs[sp], axis=0)
             acts = np.concatenate(species_acts[sp], axis=0)
             rets = np.concatenate(species_rets[sp], axis=0)
-            m = policies[sp].update(obs, acts, rets, train_cfg, entropy_beta)
+            beta = pred_entropy_beta if sp == PREDATOR else entropy_beta
+            m = policies[sp].update(obs, acts, rets, train_cfg, beta)
             update_metrics[sp] = m
 
         # ---- Greedy eval on fixed seed (so best_score is comparable across updates).
