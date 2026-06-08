@@ -329,9 +329,12 @@ def train(args: argparse.Namespace) -> None:
         # so the update is robust to the raw REINFORCE gradient magnitude.
         policy.apply(grad, args.lr, 1.0 / max(1, len(batch_rows)), args.clip)
 
-        # Greedy evaluation for an unbiased performance signal.
+        # Greedy evaluation for an unbiased performance signal. The seed is the
+        # same every update, so the eval episodes run on the same set of maps
+        # and best_eval is comparing policies on identical environments rather
+        # than easier-map vs harder-map noise.
         eval_reward = 0.0
-        eval_rng = random.Random(args.seed * 31 + update)
+        eval_rng = random.Random(args.seed * 31)
         for _ in range(args.eval_episodes):
             r, _s, _t, _ret = run_episode(env, policy, eval_rng, args.gamma, greedy=True)
             eval_reward += r
