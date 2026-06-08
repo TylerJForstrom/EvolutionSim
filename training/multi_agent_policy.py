@@ -231,3 +231,34 @@ class ActorCritic:
         p.W2 = np.array(d["W2"]); p.b2 = np.array(d["b2"])
         p.Wv = np.array(d["Wv"]); p.bv = float(d["bv"])
         return p
+
+    # ----------------------- full save/load (resume) ------------------------
+    # `to_dict` writes inference-only weights; for resuming training we also
+    # need the Adam moment estimates, the running return statistics, and the
+    # Adam step counter. We keep those in a parallel npz file rather than
+    # bloating the JSON.
+    def adam_state(self) -> dict[str, np.ndarray | float | int]:
+        return {
+            "mW1": self.mW1, "vW1": self.vW1,
+            "mb1": self.mb1, "vb1": self.vb1,
+            "mW2": self.mW2, "vW2": self.vW2,
+            "mb2": self.mb2, "vb2": self.vb2,
+            "mWv": self.mWv, "vWv": self.vWv,
+            "mbv": np.array([self.mbv]), "vbv": np.array([self.vbv]),
+            "adam_t": np.array([self.adam_t], dtype=np.int64),
+            "ret_mean": np.array([self.ret_mean]),
+            "ret_var": np.array([self.ret_var]),
+            "ret_count": np.array([self.ret_count]),
+        }
+
+    def load_adam_state(self, state: dict) -> None:
+        self.mW1 = state["mW1"]; self.vW1 = state["vW1"]
+        self.mb1 = state["mb1"]; self.vb1 = state["vb1"]
+        self.mW2 = state["mW2"]; self.vW2 = state["vW2"]
+        self.mb2 = state["mb2"]; self.vb2 = state["vb2"]
+        self.mWv = state["mWv"]; self.vWv = state["vWv"]
+        self.mbv = float(state["mbv"][0]); self.vbv = float(state["vbv"][0])
+        self.adam_t = int(state["adam_t"][0])
+        self.ret_mean = float(state["ret_mean"][0])
+        self.ret_var = float(state["ret_var"][0])
+        self.ret_count = float(state["ret_count"][0])

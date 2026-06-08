@@ -184,6 +184,20 @@ class World:
         # and its policy stays effectively random (the main pathology observed
         # in the first multi-agent training run).
         self._stalk_closeness = np.zeros(_MAX_AGENTS)
+        # Per-slot reward breakdown from the most recent step, used by the
+        # trainer to log "what fraction of each species' reward came from
+        # food vs reproduction vs threat" — essential for diagnosing why a
+        # species isn't learning.
+        self._reward_components: dict[str, np.ndarray] = {
+            "base": np.zeros(_MAX_AGENTS),
+            "food": np.zeros(_MAX_AGENTS),
+            "drink": np.zeros(_MAX_AGENTS),
+            "repro": np.zeros(_MAX_AGENTS),
+            "threat": np.zeros(_MAX_AGENTS),
+            "condition": np.zeros(_MAX_AGENTS),
+            "engineer_bonus": np.zeros(_MAX_AGENTS),
+            "death": np.zeros(_MAX_AGENTS),
+        }
 
         self._make_map()
         self._spawn_initial()
@@ -544,6 +558,8 @@ class World:
         self._offspring[:] = 0
         self._predator_threat[:] = 0.0
         self._stalk_closeness[:] = 0.0
+        for arr in self._reward_components.values():
+            arr[:] = 0.0
 
         self._update_environment()
 
@@ -942,7 +958,9 @@ class World:
     def _compute_rewards(self, live: np.ndarray) -> np.ndarray:
         """Per-species reward shaping. Reproduction dominates (it IS fitness);
         small dense signals (eat/drink/decompose/etc.) make early learning
-        tractable; species-specific threats apply."""
+        tractable; species-specific threats apply. Each component is also
+        written into self._reward_components so the trainer can log per-
+        species breakdowns."""
         r = np.zeros(_MAX_AGENTS)
         species = self.type[live]
         ate = self._ate[live]
@@ -954,37 +972,55 @@ class World:
         stalk = self._stalk_closeness[live]
         hunger = self.hunger[live]
         thirst = self.thirst[live]
-        # Small living bonus to stabilize early exploration.
-        base = 0.01
-        # Generic shaping (negative for being hungry/thirsty/in-danger).
-        # Threat coefficient is sizable so prey species get a STRONG signal to
-        # flee predators; without this prey policies never learn avoidance
-        # before predator policies learn to hunt, and the system collapses.
-        condition_penalty = (
-            np.maximum(0.0, hunger - 60.0) * 0.004
-            + np.maximum(0.0, thirst - 60.0) * 0.005
-            + threat * 1.4
-        )
-        per_live = base - condition_penalty + offspring * _REPRO_REWARD + drank * 2.5
+
+        # Component breakdown (each one written per-slot for the trainer to
+        # aggregate). Order: base + food + drink + repro + engineer_bonus
+        # - condition - threat - death.
+        base = np.full(live.size, 0.01)
         # Species-specific food signal. Predators get a small dense
         # closeness-to-prey signal on every tick PLUS the big sparse kill
-        # reward — without the dense term the predator policy has almost no
-        # gradient between kill events and stays effectively random.
-        food_signal = np.where(
+        # reward.
+        food = np.where(
             (species == HERBIVORE) | (species == ENGINEER), ate * 4.5,
             np.where(species == DECOMPOSER, ate * 5.0,
             np.where(species == POLLINATOR, ate * 5.5,
             np.where(species == PREDATOR, caught * 14.0 + stalk * 0.35, 0.0))),
         )
-        per_live += food_signal
-        # Engineer also gets a small bonus for terraforming.
-        per_live += np.where(species == ENGINEER, engineered * 0.05, 0.0)
+        drink_r = drank * 2.5
+        repro_r = offspring * _REPRO_REWARD
+        engineer_bonus = np.where(species == ENGINEER, engineered * 0.05, 0.0)
+        # Threat coefficient is sizable so prey species get a STRONG signal to
+        # flee predators; without this prey policies never learn avoidance
+        # before predator policies learn to hunt, and the system collapses.
+        threat_pen = threat * 1.4
+        condition_pen = (
+            np.maximum(0.0, hunger - 60.0) * 0.004
+            + np.maximum(0.0, thirst - 60.0) * 0.005
+        )
+
+        per_live = base + food + drink_r + repro_r + engineer_bonus - threat_pen - condition_pen
         r[live] = per_live
+
+        # Store breakdown.
+        self._reward_components["base"][live] = base
+        self._reward_components["food"][live] = food
+        self._reward_components["drink"][live] = drink_r
+        self._reward_components["repro"][live] = repro_r
+        self._reward_components["engineer_bonus"][live] = engineer_bonus
+        self._reward_components["threat"][live] = -threat_pen
+        self._reward_components["condition"][live] = -condition_pen
+
         # Death penalty (energy<=0 OR exceeded maxAge).
         max_ages = np.array([SPECIES_PARAMS[i]["max_age"] for i in range(N_SPECIES)])
         died = (self.energy[live] <= 0.0) | (self.age[live] > max_ages[self.type[live]])
-        r[live[died]] -= _DEATH_PENALTY
+        died_slots = live[died]
+        r[died_slots] -= _DEATH_PENALTY
+        self._reward_components["death"][died_slots] = -_DEATH_PENALTY
         return r
+
+    def reward_components(self) -> dict[str, np.ndarray]:
+        """Per-slot reward breakdown from the most recent step. Read-only view."""
+        return self._reward_components
 
     # ------------------------------ stats ----------------------------------
     def population_counts(self) -> dict[str, int]:

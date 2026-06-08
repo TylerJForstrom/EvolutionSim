@@ -10,8 +10,19 @@ simulation, each learning to thrive in a world that is also adapting.
 This is coevolutionary RL: the environment from any one species' view is
 non-stationary by construction. That's intentional — it's the Red Queen.
 
+Long-run features for real training:
+- multi-seed greedy eval (averages out per-map noise so `best_eval` actually
+  tracks policy improvement instead of luck)
+- periodic best-and-last checkpointing every `--save-every` updates (so an
+  interrupted run isn't lost; last/ also saves Adam state for resume)
+- `--resume <dir>` reloads policies + Adam state + history and continues
+- per-species reward breakdown logged every `--log-breakdown-every` updates
+  (shows what fraction of each species' reward came from food vs reproduction
+  vs threat vs death — essential for diagnosing stuck learners)
+
 Usage:
-    python training/train_multi_agent.py --updates 60 --episode-ticks 600 --batch 2
+    python training/train_multi_agent.py --updates 200 --batch 3 --episode-ticks 600 --log-every 10
+    python training/train_multi_agent.py --resume models_multi/last  # continue
 """
 
 from __future__ import annotations
@@ -33,6 +44,9 @@ from multi_agent_env import (  # noqa: E402
     N_ACTIONS, N_SPECIES, OBS_DIM, PREDATOR, SPECIES_NAMES, World, _MAX_AGENTS,
 )
 from multi_agent_policy import ActorCritic, TrainConfig  # noqa: E402
+
+
+REWARD_CATEGORIES = ("base", "food", "drink", "repro", "engineer_bonus", "threat", "condition", "death")
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +98,6 @@ class TrajBuffer:
             rews = self.rews[slot]
             if not rews:
                 continue
-            # Discounted return-to-go for this lifetime.
             G = 0.0
             returns = [0.0] * len(rews)
             for i in range(len(rews) - 1, -1, -1):
@@ -95,7 +108,6 @@ class TrajBuffer:
             per_returns[sp].extend(returns)
             per_episode_rewards[sp] += sum(rews)
             per_lifetimes[sp].append(len(rews))
-        # Stack to arrays.
         out = {}
         for sp in range(N_SPECIES):
             if per_obs[sp]:
@@ -122,16 +134,19 @@ def run_episode(
     policies: list[ActorCritic],
     episode_ticks: int,
     greedy: bool = False,
+    collect_breakdown: bool = False,
 ):
-    """Roll out one episode. Returns the populated TrajBuffer plus per-species
-    final population counts."""
+    """Roll out one episode. Returns the populated TrajBuffer, per-species
+    final pop counts, and (optionally) reward-category totals per species."""
     buf = TrajBuffer()
-    # Initialize trajectories for all agents alive at episode start.
     for slot in np.where(world.alive)[0]:
         buf.start(int(slot), int(world.type[slot]))
 
+    # Per-species per-category running totals across the episode.
+    breakdown = {sp: {cat: 0.0 for cat in REWARD_CATEGORIES} for sp in range(N_SPECIES)} if collect_breakdown else None
+    breakdown_steps = {sp: 0 for sp in range(N_SPECIES)} if collect_breakdown else None
+
     for _ in range(episode_ticks):
-        # Per species: observe, act, set pending actions on world.
         per_species_slots: list[np.ndarray] = [np.array([], dtype=np.int64)] * N_SPECIES
         per_species_obs: list[np.ndarray] = [np.zeros((0, OBS_DIM))] * N_SPECIES
         per_species_acts: list[np.ndarray] = [np.zeros(0, dtype=np.int32)] * N_SPECIES
@@ -145,10 +160,8 @@ def run_episode(
             per_species_obs[sp] = obs
             per_species_acts[sp] = actions
 
-        # Advance world; rewards/deaths/births returned per slot.
         info = world.step_world()
 
-        # Record transitions for agents that acted this tick.
         for sp in range(N_SPECIES):
             slots = per_species_slots[sp]
             if slots.size == 0:
@@ -159,15 +172,143 @@ def run_episode(
             for i in range(slots.size):
                 buf.append(int(slots[i]), obs[i], int(acts[i]), float(rewards[i]))
 
-        # Start trajectories for newborns (they'll observe & act next tick).
+        if collect_breakdown:
+            components = world.reward_components()
+            types = world.type
+            for sp in range(N_SPECIES):
+                slots = per_species_slots[sp]
+                if slots.size == 0:
+                    continue
+                breakdown_steps[sp] += int(slots.size)
+                for cat in REWARD_CATEGORIES:
+                    breakdown[sp][cat] += float(components[cat][slots].sum())
+
         for slot in info.just_born_slots:
             buf.start(int(slot), int(world.type[slot]))
 
-        # If everything is dead, stop early.
         if not world.alive.any():
             break
 
-    return buf, world.population_counts()
+    return buf, world.population_counts(), breakdown, breakdown_steps
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint I/O
+# ---------------------------------------------------------------------------
+
+def _write_policy_files(out_dir: Path, policies: list[ActorCritic], best_eval: float) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for sp in range(N_SPECIES):
+        d = policies[sp].to_dict()
+        d["species"] = SPECIES_NAMES[sp]
+        d["best_eval_score"] = best_eval
+        d["actions"] = ["stay", "n", "ne", "e", "se", "s", "sw", "w", "nw"]
+        d["obs_dim"] = OBS_DIM
+        (out_dir / f"{SPECIES_NAMES[sp]}_policy.json").write_text(json.dumps(d, indent=2), encoding="utf-8")
+
+
+def save_checkpoint(
+    root: Path,
+    kind: str,
+    policies: list[ActorCritic],
+    history: list[dict],
+    best_eval: float,
+    update: int,
+    *,
+    save_adam: bool,
+) -> None:
+    """kind is 'best' or 'last'. Writes per-species policy JSON; for 'last',
+    also writes Adam state per species and a training_state.json so a future
+    --resume can pick up exactly where we left off."""
+    sub = root / kind
+    sub.mkdir(parents=True, exist_ok=True)
+    _write_policy_files(sub, policies, best_eval)
+    state = {
+        "update": int(update),
+        "best_eval_score": float(best_eval),
+        "kind": kind,
+    }
+    (sub / "training_state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
+    # History is the same for best/last — write at root.
+    (root / "multi_agent_history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+    if save_adam:
+        for sp in range(N_SPECIES):
+            adam = policies[sp].adam_state()
+            np.savez(sub / f"{SPECIES_NAMES[sp]}_adam.npz", **adam)
+
+
+def load_checkpoint(
+    root: Path,
+    train_cfg: TrainConfig,
+) -> tuple[list[ActorCritic], list[dict], int, float]:
+    """Load policies (with Adam state), history, last update, and best_eval.
+
+    `root` should be a directory written by save_checkpoint with kind='last'.
+    """
+    if not (root / "training_state.json").exists():
+        raise FileNotFoundError(f"no training_state.json at {root}")
+    state = json.loads((root / "training_state.json").read_text(encoding="utf-8"))
+    policies: list[ActorCritic] = []
+    for sp in range(N_SPECIES):
+        pdict = json.loads((root / f"{SPECIES_NAMES[sp]}_policy.json").read_text(encoding="utf-8"))
+        p = ActorCritic.from_dict(pdict, seed=sp)
+        adam_path = root / f"{SPECIES_NAMES[sp]}_adam.npz"
+        if adam_path.exists():
+            with np.load(adam_path) as data:
+                p.load_adam_state({k: data[k] for k in data.files})
+        policies.append(p)
+    history_path = root.parent / "multi_agent_history.json"
+    history = json.loads(history_path.read_text(encoding="utf-8")) if history_path.exists() else []
+    return policies, history, int(state["update"]), float(state["best_eval_score"])
+
+
+# ---------------------------------------------------------------------------
+# Multi-seed eval
+# ---------------------------------------------------------------------------
+
+def evaluate(
+    world: World,
+    policies: list[ActorCritic],
+    episode_ticks: int,
+    eval_seed_base: int,
+    n_episodes: int,
+):
+    """Run n_episodes greedy episodes, each at a different fixed seed, and
+    return averaged metrics: eval_score, per-species mean per-life reward,
+    per-species final pop, per-species reward breakdown."""
+    species_rewards = [0.0] * N_SPECIES
+    species_lifetimes = [0] * N_SPECIES
+    pop_totals = {SPECIES_NAMES[sp]: 0 for sp in range(N_SPECIES)}
+    breakdown_totals = {sp: {cat: 0.0 for cat in REWARD_CATEGORIES} for sp in range(N_SPECIES)}
+    breakdown_steps = {sp: 0 for sp in range(N_SPECIES)}
+    for ep in range(n_episodes):
+        world.reset(seed=eval_seed_base + ep * 13)
+        buf, pops, bd, bd_steps = run_episode(
+            world, policies, episode_ticks, greedy=True, collect_breakdown=True,
+        )
+        _, ep_rewards, lifetimes = buf.to_species_batches(0.99)
+        for sp in range(N_SPECIES):
+            species_rewards[sp] += ep_rewards[sp]
+            species_lifetimes[sp] += len(lifetimes[sp])
+            pop_totals[SPECIES_NAMES[sp]] += pops[SPECIES_NAMES[sp]]
+            for cat in REWARD_CATEGORIES:
+                breakdown_totals[sp][cat] += bd[sp][cat]
+            breakdown_steps[sp] += bd_steps[sp]
+    eval_score = 0.0
+    for sp in range(N_SPECIES):
+        lives = max(1, species_lifetimes[sp])
+        eval_score += species_rewards[sp] / lives
+    avg_pop = {k: v / n_episodes for k, v in pop_totals.items()}
+    return {
+        "eval_score": eval_score,
+        "species_rewards_per_life": [
+            species_rewards[sp] / max(1, species_lifetimes[sp]) for sp in range(N_SPECIES)
+        ],
+        "species_lifetimes": species_lifetimes,
+        "avg_pop": avg_pop,
+        "breakdown_totals": breakdown_totals,
+        "breakdown_steps": breakdown_steps,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -185,31 +326,50 @@ def train(args: argparse.Namespace) -> None:
         grad_clip=args.clip,
         hidden=args.hidden,
     )
-    policies = [
-        ActorCritic(OBS_DIM, N_ACTIONS, hidden=train_cfg.hidden, seed=rng_seed * 17 + sp)
-        for sp in range(N_SPECIES)
-    ]
 
-    world = World(seed=rng_seed)
+    out_dir = Path(args.out_dir)
+
+    # --- Resume or fresh start ---
+    start_update = 1
     history: list[dict] = []
     best_eval_score = -1e18
-    best_models = {sp: policies[sp].to_dict() for sp in range(N_SPECIES)}
+    best_models: dict[int, dict] | None = None
+    if args.resume:
+        resume_path = Path(args.resume)
+        policies, history, start_update_loaded, best_eval_score = load_checkpoint(resume_path, train_cfg)
+        start_update = start_update_loaded + 1
+        print(f"resumed from {resume_path} at update {start_update_loaded}, best_eval={best_eval_score:.2f}")
+    else:
+        policies = [
+            ActorCritic(OBS_DIM, N_ACTIONS, hidden=train_cfg.hidden, seed=rng_seed * 17 + sp)
+            for sp in range(N_SPECIES)
+        ]
 
+    world = World(seed=rng_seed)
     t_start = time.time()
-    for update in range(1, args.updates + 1):
+    eval_seed_base = rng_seed * 31
+
+    for update in range(start_update, args.updates + 1):
         frac = update / args.updates
         entropy_beta = train_cfg.entropy_beta_init * (1.0 - frac) + train_cfg.entropy_beta_final * frac
+        # Predator gets a slower entropy decay because its training task is
+        # the hardest and its population is smallest. Without this it stays
+        # near-uniform and never escapes random.
+        pred_frac = frac * 0.4
+        pred_entropy_beta = (
+            train_cfg.entropy_beta_init * (1.0 - pred_frac)
+            + train_cfg.entropy_beta_final * pred_frac
+        )
 
-        # ---- Collect rollouts: `batch` episodes per update.
+        # --- Collect rollouts ---
         species_obs: list[list[np.ndarray]] = [[] for _ in range(N_SPECIES)]
         species_acts: list[list[np.ndarray]] = [[] for _ in range(N_SPECIES)]
         species_rets: list[list[np.ndarray]] = [[] for _ in range(N_SPECIES)]
         ep_rewards_total = [0.0] * N_SPECIES
         ep_lifetimes: list[list[int]] = [[] for _ in range(N_SPECIES)]
-        final_pop_running = {sp: 0 for sp in range(N_SPECIES)}
         for ep in range(args.batch):
             world.reset(seed=rng_seed * 31 + update * 7 + ep)
-            buf, pops = run_episode(world, policies, args.episode_ticks, greedy=False)
+            buf, pops, _bd, _bds = run_episode(world, policies, args.episode_ticks, greedy=False)
             batches, ep_rewards, lifetimes = buf.to_species_batches(train_cfg.gamma)
             for sp in range(N_SPECIES):
                 o, a, r = batches[sp]
@@ -219,19 +379,8 @@ def train(args: argparse.Namespace) -> None:
                     species_rets[sp].append(r)
                 ep_rewards_total[sp] += ep_rewards[sp]
                 ep_lifetimes[sp].extend(lifetimes[sp])
-                final_pop_running[sp] += pops[SPECIES_NAMES[sp]]
 
-        # ---- Per-species update.
-        # Predator gets a slower entropy decay because (a) its training task
-        # is the hardest (sparse rewards, mobile targets), and (b) its
-        # population is smallest so it sees the fewest transitions per
-        # update. Without this it converges to a near-uniform policy by the
-        # time the schedule reaches its final beta and never escapes.
-        pred_frac = frac * 0.4  # predator entropy decays at 40% of nominal rate
-        pred_entropy_beta = (
-            train_cfg.entropy_beta_init * (1.0 - pred_frac)
-            + train_cfg.entropy_beta_final * pred_frac
-        )
+        # --- Per-species update ---
         update_metrics = {}
         for sp in range(N_SPECIES):
             if not species_obs[sp]:
@@ -244,67 +393,69 @@ def train(args: argparse.Namespace) -> None:
             m = policies[sp].update(obs, acts, rets, train_cfg, beta)
             update_metrics[sp] = m
 
-        # ---- Greedy eval on fixed seed (so best_score is comparable across updates).
-        world.reset(seed=rng_seed * 31)
-        eval_buf, eval_pops = run_episode(world, policies, args.episode_ticks, greedy=True)
-        eval_batches, eval_rewards, eval_lifetimes = eval_buf.to_species_batches(train_cfg.gamma)
-        # "score" = sum of mean episode reward per species (so all species
-        # matter equally), normalized so it doesn't blow up when a species
-        # has few agents.
-        eval_score = 0.0
-        for sp in range(N_SPECIES):
-            n_lives = max(1, len(eval_lifetimes[sp]))
-            eval_score += eval_rewards[sp] / n_lives
+        # --- Multi-seed greedy eval ---
+        eval_result = evaluate(
+            world, policies, args.episode_ticks, eval_seed_base, args.eval_episodes,
+        )
+        eval_score = eval_result["eval_score"]
 
-        if eval_score > best_eval_score:
+        new_best = eval_score > best_eval_score
+        if new_best:
             best_eval_score = eval_score
-            best_models = {sp: policies[sp].to_dict() for sp in range(N_SPECIES)}
 
-        # ---- Log.
+        # --- Log ---
         elapsed = time.time() - t_start
-        if update == 1 or update % args.log_every == 0:
-            train_lines = []
-            eval_lines = []
+        log_this = update == start_update or update % args.log_every == 0 or update == args.updates
+        log_breakdown = args.log_breakdown_every > 0 and (update == start_update or update % args.log_breakdown_every == 0 or update == args.updates)
+        if log_this:
+            eval_pop_str = " ".join(f"{SPECIES_NAMES[sp][:4]}={eval_result['avg_pop'][SPECIES_NAMES[sp]]:.1f}" for sp in range(N_SPECIES))
+            print(
+                f"u={update:3d} t={elapsed:6.0f}s eval_score={eval_score:7.2f} best={best_eval_score:7.2f}"
+                f"  | eval_avg_pop: {eval_pop_str}"
+                + ("  [NEW BEST]" if new_best else "")
+            )
             for sp in range(N_SPECIES):
                 n_lives = max(1, len(ep_lifetimes[sp]))
                 avg_life = sum(ep_lifetimes[sp]) / n_lives if ep_lifetimes[sp] else 0.0
-                avg_rew = ep_rewards_total[sp] / max(1, args.batch) / max(1, n_lives / max(1, args.batch))
                 m = update_metrics[sp]
-                train_lines.append(
-                    f"{SPECIES_NAMES[sp][:4]:>4}: r={avg_rew:6.2f} life={avg_life:5.1f} H={m['entropy']:.2f} vL={m['value_loss']:.2f} n={m['n']}"
+                train_r = ep_rewards_total[sp] / max(1, len(ep_lifetimes[sp])) if ep_lifetimes[sp] else 0.0
+                eval_r = eval_result["species_rewards_per_life"][sp]
+                print(
+                    f"    {SPECIES_NAMES[sp][:4]:>4}: train_r={train_r:6.2f} eval_r={eval_r:6.2f} life={avg_life:5.1f} "
+                    f"H={m['entropy']:.2f} vL={m['value_loss']:.2f} n={m['n']}"
                 )
-                eval_pop = eval_pops.get(SPECIES_NAMES[sp], 0)
-                eval_lines.append(f"{SPECIES_NAMES[sp][:4]:>4}={eval_pop}")
-            print(
-                f"u={update:3d} t={elapsed:6.0f}s eval_score={eval_score:7.2f} best={best_eval_score:7.2f}"
-                f"  | eval_final_pop: " + " ".join(eval_lines)
-            )
-            for line in train_lines:
-                print("    " + line)
+        if log_breakdown:
+            print("    -- reward breakdown (% of total positive + negative reward per species, from eval) --")
+            for sp in range(N_SPECIES):
+                steps = max(1, eval_result["breakdown_steps"][sp])
+                totals = eval_result["breakdown_totals"][sp]
+                total_abs = sum(abs(v) for v in totals.values()) or 1.0
+                pct = {cat: 100.0 * totals[cat] / total_abs for cat in REWARD_CATEGORIES}
+                pct_str = " ".join(f"{cat[:5]}={pct[cat]:+5.1f}%" for cat in REWARD_CATEGORIES)
+                print(f"    {SPECIES_NAMES[sp][:4]:>4}: steps={steps:6d}  {pct_str}")
 
         history.append({
             "update": update,
             "elapsed_s": elapsed,
             "eval_score": eval_score,
             "best_eval_score": best_eval_score,
-            "eval_population": eval_pops,
+            "eval_avg_pop": eval_result["avg_pop"],
             "train_metrics": {SPECIES_NAMES[sp]: update_metrics[sp] for sp in range(N_SPECIES)},
         })
 
-    # ---- Save.
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for sp in range(N_SPECIES):
-        path = out_dir / f"{SPECIES_NAMES[sp]}_policy.json"
-        payload = best_models[sp]
-        payload["species"] = SPECIES_NAMES[sp]
-        payload["best_eval_score"] = best_eval_score
-        payload["actions"] = ["stay", "n", "ne", "e", "se", "s", "sw", "w", "nw"]
-        payload["obs_dim"] = OBS_DIM
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    (out_dir / "multi_agent_history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
-    print(f"\nsaved {N_SPECIES} per-species best policies to {out_dir}/")
-    print(f"best multi-species eval_score = {best_eval_score:.2f}")
+        # --- Periodic checkpointing ---
+        if new_best:
+            save_checkpoint(out_dir, "best", policies, history, best_eval_score, update, save_adam=False)
+        if args.save_every > 0 and (update % args.save_every == 0 or update == args.updates):
+            save_checkpoint(out_dir, "last", policies, history, best_eval_score, update, save_adam=True)
+
+    # --- Final save ---
+    save_checkpoint(out_dir, "last", policies, history, best_eval_score, args.updates, save_adam=True)
+    print(f"\nbest multi-species eval_score = {best_eval_score:.2f}")
+    print(f"best checkpoints (inference): {out_dir}/best/")
+    print(f"last checkpoint (resume-able): {out_dir}/last/")
+    print(f"history: {out_dir}/multi_agent_history.json")
+    print(f"\nresume with:  python training/train_multi_agent.py --resume {out_dir}/last --updates <bigger_N>")
 
 
 def parse_args() -> argparse.Namespace:
@@ -321,7 +472,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--value-coef", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--log-every", type=int, default=2)
+    parser.add_argument("--log-breakdown-every", type=int, default=10,
+                        help="log per-species reward breakdown every N updates (0 to disable)")
+    parser.add_argument("--eval-episodes", type=int, default=3,
+                        help="number of greedy eval episodes per update")
+    parser.add_argument("--save-every", type=int, default=5,
+                        help="checkpoint 'last' every N updates (best is saved on improvement)")
     parser.add_argument("--out-dir", default="models_multi")
+    parser.add_argument("--resume", default=None,
+                        help="path to a `last/` checkpoint dir to resume from")
     return parser.parse_args()
 
 
