@@ -2,3 +2,9 @@ __pycache__/
 *.py[cod]
 models/
 models_smoke/
+
+# Bench run artifacts (the harness + notes are tracked; outputs are not)
+isolate-*.log
+bench/prof.txt
+bench/results_*.txt
+bench/baseline.sim.js
