@@ -1,20 +1,34 @@
 """Headless ecosystem training environment.
 
-This is intentionally small and dependency-free so it can run immediately.
-It mirrors the browser simulator's key mechanics: food, water, elevation,
-slope cost, hunger, thirst, predators, and survival/reproduction-style fitness.
+Dependency-free so it runs immediately. It mirrors the browser simulator's key
+ecological mechanics so a policy trained here faces the same pressures a real
+herbivore does:
+
+- renewable forage: vegetation regrows *logistically* toward a local carrying
+  capacity, so over-grazing a patch has consequences (it does not just deplete),
+- mobile, pursuing predators (not stationary hazards),
+- Kleiber/Q10 metabolism: energy burn rises with body mass^0.75 and temperature,
+- elevation, slope cost, roughness, and water drag on movement,
+- hunger, thirst, starvation, and dehydration,
+- fitness = lifetime reproductive success: a well-fed adult can reproduce, which
+  is the real selection target, not mere survival time.
 """
 
 from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 GRID_W = 96
 GRID_H = 64
 ACTIONS = ("stay", "n", "ne", "e", "se", "s", "sw", "w", "nw")
+
+# Ecological constants (mirroring sim.js).
+KLEIBER_EXP = 0.75
+Q10 = 2.3
+YEAR_STEPS = 600  # one seasonal cycle
 
 
 def clamp(value: float, lo: float, hi: float) -> float:
@@ -58,21 +72,43 @@ class Cell:
     roughness: float
     water: float
     food: float
+    food_cap: float
     temp: float
+
+
+@dataclass
+class Predator:
+    x: float
+    y: float
 
 
 @dataclass
 class Animal:
     x: float
     y: float
+    body: float = 1.0
     hunger: float = 25.0
     thirst: float = 25.0
     energy: float = 100.0
     age: int = 0
+    offspring: int = 0
+    breed_cooldown: int = 0
 
 
 class EcosystemEnv:
-    """Single-herbivore training environment with realistic constraints."""
+    """Single-herbivore training environment with renewable forage, mobile
+    predators, metabolic temperature dependence, and reproductive fitness."""
+
+    # Tunables.
+    BASE_SPEED = 0.85
+    METABOLISM = 0.05
+    PRED_SPEED = 0.55
+    PRED_DETECT = 9.0
+    PRED_CATCH = 1.3
+    FOOD_REGROW = 0.035
+    REPRO_ENERGY = 90.0
+    REPRO_COST = 32.0
+    REPRO_MIN_AGE = 40
 
     def __init__(self, seed: int = 1, max_steps: int = 600) -> None:
         self.seed = seed
@@ -80,7 +116,7 @@ class EcosystemEnv:
         self.max_steps = max_steps
         self.map_seed = seed * 9973 + 17
         self.cells: list[Cell] = []
-        self.predators: list[tuple[float, float]] = []
+        self.predators: list[Predator] = []
         self.animal = Animal(0.0, 0.0)
         self.steps = 0
         self.last_slope = 0.0
@@ -96,18 +132,47 @@ class EcosystemEnv:
         self.last_slope = 0.0
         self.last_terrain_factor = 1.0
         self.cells = self._make_map()
-        self.predators = self._spawn_predators(12)
+        self.predators = self._spawn_predators(10)
         self.animal = self._spawn_herbivore()
         return self.observe()
+
+    # --- environment dynamics ------------------------------------------------
+    def season_sun(self) -> float:
+        phase = (self.steps % YEAR_STEPS) / YEAR_STEPS
+        # Smooth seasonal light/forage signal in [0.45, 1.0].
+        return 0.72 + 0.28 * math.sin(phase * 2.0 * math.pi - math.pi / 2.0)
+
+    def _regrow_food(self) -> None:
+        sun = self.season_sun()
+        rate = self.FOOD_REGROW * sun
+        for c in self.cells:
+            if c.food_cap <= 0.0:
+                continue
+            # Logistic regrowth toward the cell's carrying capacity.
+            c.food = clamp(c.food + rate * c.food * (1.0 - c.food / c.food_cap) + 0.0008 * c.food_cap, 0.0, c.food_cap)
+
+    def _move_predators(self) -> None:
+        ax, ay = self.animal.x, self.animal.y
+        for p in self.predators:
+            dx = ax - p.x
+            dy = ay - p.y
+            dist = math.hypot(dx, dy)
+            if dist < self.PRED_DETECT and dist > 1e-6:
+                # Pursue the herbivore.
+                p.x = clamp(p.x + (dx / dist) * self.PRED_SPEED, 0.0, GRID_W - 1.001)
+                p.y = clamp(p.y + (dy / dist) * self.PRED_SPEED, 0.0, GRID_H - 1.001)
+            else:
+                # Random search walk.
+                p.x = clamp(p.x + self.rng.uniform(-1.0, 1.0) * self.PRED_SPEED * 0.6, 0.0, GRID_W - 1.001)
+                p.y = clamp(p.y + self.rng.uniform(-1.0, 1.0) * self.PRED_SPEED * 0.6, 0.0, GRID_H - 1.001)
 
     def step(self, action_index: int) -> tuple[list[float], float, bool, dict[str, float]]:
         action_index = max(0, min(len(ACTIONS) - 1, int(action_index)))
         dx, dy = self._action_delta(action_index)
         old_cell = self.cell_at(self.animal.x, self.animal.y)
 
-        base_speed = 0.85
-        target_x = clamp(self.animal.x + dx * base_speed, 0.0, GRID_W - 1.001)
-        target_y = clamp(self.animal.y + dy * base_speed, 0.0, GRID_H - 1.001)
+        target_x = clamp(self.animal.x + dx * self.BASE_SPEED, 0.0, GRID_W - 1.001)
+        target_y = clamp(self.animal.y + dy * self.BASE_SPEED, 0.0, GRID_H - 1.001)
         next_cell = self.cell_at(target_x, target_y)
 
         slope = next_cell.elevation - old_cell.elevation
@@ -116,30 +181,43 @@ class EcosystemEnv:
         roughness = (old_cell.roughness + next_cell.roughness) * 0.5
         water_drag = 0.22 if next_cell.water > 0.68 else 0.0
         terrain_factor = clamp(1.0 - uphill * 4.0 - roughness * 0.25 - water_drag + downhill * 0.7, 0.18, 1.18)
-        effort = base_speed * (1.0 + uphill * 10.0 + roughness * 0.9 + water_drag)
+        effort = self.BASE_SPEED * (1.0 + uphill * 10.0 + roughness * 0.9 + water_drag)
 
-        self.animal.x = clamp(self.animal.x + dx * base_speed * terrain_factor, 0.0, GRID_W - 1.001)
-        self.animal.y = clamp(self.animal.y + dy * base_speed * terrain_factor, 0.0, GRID_H - 1.001)
+        self.animal.x = clamp(self.animal.x + dx * self.BASE_SPEED * terrain_factor, 0.0, GRID_W - 1.001)
+        self.animal.y = clamp(self.animal.y + dy * self.BASE_SPEED * terrain_factor, 0.0, GRID_H - 1.001)
         cell = self.cell_at(self.animal.x, self.animal.y)
         self.last_slope = slope
         self.last_terrain_factor = terrain_factor
 
         self.animal.age += 1
         self.steps += 1
+        if self.animal.breed_cooldown > 0:
+            self.animal.breed_cooldown -= 1
+
+        # Renewable forage and mobile predators update each step.
+        self._regrow_food()
+        self._move_predators()
+
+        # Kleiber + Q10 metabolism: basal burn scales with mass^0.75 and rises
+        # with temperature above the comfort band.
+        mass_metab = self.animal.body ** KLEIBER_EXP
+        q10 = clamp(Q10 ** ((cell.temp - 20.0) / 10.0), 0.55, 2.6)
+        basal = self.METABOLISM * mass_metab * q10
+
         self.animal.hunger = clamp(self.animal.hunger + 0.22 + effort * 0.24, 0.0, 140.0)
         self.animal.thirst = clamp(
             self.animal.thirst + 0.18 + effort * 0.22 + max(0.0, cell.temp - 22.0) * 0.015,
             0.0,
             150.0,
         )
-        self.animal.energy -= 0.035 + effort * 0.04 + uphill * 0.5
+        self.animal.energy -= basal + effort * 0.04 + uphill * 0.5
 
         ate = 0.0
         if cell.food > 0.08:
-            ate = min(cell.food, 0.12)
+            ate = min(cell.food, 0.12 * self.animal.body)
             cell.food -= ate
             self.animal.hunger = clamp(self.animal.hunger - ate * 145.0, 0.0, 140.0)
-            self.animal.energy = clamp(self.animal.energy + ate * 24.0, 0.0, 130.0)
+            self.animal.energy = clamp(self.animal.energy + ate * 24.0, 0.0, 160.0)
 
         drank = 0.0
         if cell.water > 0.55:
@@ -148,9 +226,11 @@ class EcosystemEnv:
 
         predator_dist = self.nearest_predator_distance()
         predator_penalty = 0.0
-        if predator_dist < 1.4:
+        caught = False
+        if predator_dist < self.PRED_CATCH:
             predator_penalty = 45.0
-            self.animal.energy -= 70.0
+            self.animal.energy -= 80.0
+            caught = self.animal.energy <= 0.0
         elif predator_dist < 5.0:
             predator_penalty = (5.0 - predator_dist) * 0.7
 
@@ -158,10 +238,25 @@ class EcosystemEnv:
         dehydration = max(0.0, self.animal.thirst - 86.0) * 0.045
         self.animal.energy -= starvation + dehydration
 
+        # Reproduction = realized fitness. A well-fed, hydrated adult breeds.
+        repro_reward = 0.0
+        if (
+            self.animal.energy >= self.REPRO_ENERGY
+            and self.animal.age >= self.REPRO_MIN_AGE
+            and self.animal.breed_cooldown == 0
+            and self.animal.hunger < 55.0
+            and self.animal.thirst < 60.0
+        ):
+            self.animal.energy -= self.REPRO_COST
+            self.animal.offspring += 1
+            self.animal.breed_cooldown = 35
+            repro_reward = 12.0
+
         reward = (
-            0.08
+            0.04
             + ate * 5.0
-            + drank * 3.8
+            + drank * 3.0
+            + repro_reward
             - self.animal.hunger * 0.003
             - self.animal.thirst * 0.004
             - uphill * 0.22
@@ -181,6 +276,8 @@ class EcosystemEnv:
             "predator_dist": predator_dist,
             "ate": ate,
             "drank": drank,
+            "offspring": float(self.animal.offspring),
+            "caught": 1.0 if caught else 0.0,
         }
         return self.observe(), reward, done, info
 
@@ -189,8 +286,9 @@ class EcosystemEnv:
         food_dx, food_dy, food_score = self._sense("food")
         water_dx, water_dy, water_score = self._sense("water")
         pred_dx, pred_dy, pred_score = self._sense_predator()
+        repro_ready = 1.0 if (self.animal.energy >= self.REPRO_ENERGY and self.animal.breed_cooldown == 0) else 0.0
         return [
-            self.animal.energy / 130.0,
+            self.animal.energy / 160.0,
             self.animal.hunger / 140.0,
             self.animal.thirst / 150.0,
             cell.food,
@@ -209,6 +307,8 @@ class EcosystemEnv:
             pred_dx,
             pred_dy,
             pred_score,
+            repro_ready,
+            self.season_sun(),
         ]
 
     @property
@@ -225,7 +325,7 @@ class EcosystemEnv:
         return self.cells[iy * GRID_W + ix]
 
     def nearest_predator_distance(self) -> float:
-        return min(math.hypot(px - self.animal.x, py - self.animal.y) for px, py in self.predators)
+        return min(math.hypot(p.x - self.animal.x, p.y - self.animal.y) for p in self.predators)
 
     def _make_map(self) -> list[Cell]:
         cells: list[Cell] = []
@@ -245,10 +345,10 @@ class EcosystemEnv:
                 moisture = clamp(0.34 + valley * 0.65 + (fractal_noise(x, y, self.map_seed + 41) - 0.5) * 0.5 - elevation * 0.3, 0.0, 1.0)
                 water = 1.0 if moisture > 0.73 or valley > 0.7 or elevation < 0.1 else moisture
                 temp = 29.0 - (y / (GRID_H - 1)) * 16.0 - elevation * 8.0
-                food = clamp(0.08 + moisture * 0.6 - elevation * 0.18 + fractal_noise(x, y, self.map_seed + 99) * 0.25, 0.0, 1.0)
+                food_cap = clamp(0.08 + moisture * 0.6 - elevation * 0.18 + fractal_noise(x, y, self.map_seed + 99) * 0.25, 0.0, 1.0)
                 if water > 0.82:
-                    food *= 0.5
-                cells.append(Cell(elevation=elevation, roughness=roughness, water=water, food=food, temp=temp))
+                    food_cap *= 0.5
+                cells.append(Cell(elevation=elevation, roughness=roughness, water=water, food=food_cap, food_cap=food_cap, temp=temp))
         return cells
 
     def _spawn_herbivore(self) -> Animal:
@@ -260,10 +360,10 @@ class EcosystemEnv:
                 return Animal(x=x, y=y)
         return Animal(x=GRID_W * 0.5, y=GRID_H * 0.5)
 
-    def _spawn_predators(self, count: int) -> list[tuple[float, float]]:
-        predators: list[tuple[float, float]] = []
+    def _spawn_predators(self, count: int) -> list[Predator]:
+        predators: list[Predator] = []
         for _ in range(count):
-            predators.append((self.rng.uniform(0, GRID_W - 1), self.rng.uniform(0, GRID_H - 1)))
+            predators.append(Predator(self.rng.uniform(0, GRID_W - 1), self.rng.uniform(0, GRID_H - 1)))
         return predators
 
     def _action_delta(self, action: int) -> tuple[float, float]:
@@ -292,10 +392,10 @@ class EcosystemEnv:
 
     def _sense_predator(self) -> tuple[float, float, float]:
         best = (999.0, 0.0, 0.0)
-        for px, py in self.predators:
-            dist = math.hypot(px - self.animal.x, py - self.animal.y)
+        for p in self.predators:
+            dist = math.hypot(p.x - self.animal.x, p.y - self.animal.y)
             if dist < best[0]:
-                best = (dist, px, py)
+                best = (dist, p.x, p.y)
         dist, px, py = best
         if dist <= 0.001:
             return (0.0, 0.0, 1.0)
