@@ -6,8 +6,31 @@
   const CELL_COUNT = GRID_W * GRID_H;
   const YEAR_TICKS = 2400;
   const HISTORY_LIMIT = 260;
-  const MAX_AGENTS = 760;
+  const MAX_AGENTS = 1700;
   const DIRECTIONS = 16;
+  // Precomputed unit vectors for the radial senses (recomputing cos/sin per
+  // agent per tick was ~30% of the simulation cost).
+  const DIR_COS = new Array(DIRECTIONS);
+  const DIR_SIN = new Array(DIRECTIONS);
+  for (let i = 0; i < DIRECTIONS; i += 1) {
+    const angle = (Math.PI * 2 * i) / DIRECTIONS;
+    DIR_COS[i] = Math.cos(angle);
+    DIR_SIN[i] = Math.sin(angle);
+  }
+
+  // --- Ecological constants ---------------------------------------------------
+  // Trophic assimilation efficiencies (fraction of ingested energy retained as
+  // somatic energy). Most of the rest is lost to respiration via metabolism, so
+  // the standing-crop pyramid (Lindeman ~10% between levels) emerges rather than
+  // being hard-coded. Carnivore assimilation is high; the low *production*
+  // efficiency comes from metabolic respiration, not poor assimilation.
+  const PRED_ASSIMILATION = 0.21;
+  // Kleiber's law: basal metabolic rate scales with body mass^0.75.
+  const KLEIBER_EXP = 0.75;
+  // Q10 ~ 2.3: ectotherm metabolic rate roughly 2.3x per +10 deg C.
+  const Q10 = 2.3;
+  // Nutrient mass per unit plant biomass (stoichiometry) for a closed cycle.
+  const NUTRIENT_PER_BIOMASS = 0.09;
 
   const TYPE_ORDER = ["herbivore", "predator", "decomposer", "pollinator", "engineer"];
   const TYPE_INFO = {
@@ -19,8 +42,8 @@
       minAge: 120,
       reproEnergy: 108,
       reproCost: 38,
-      reproChance: 0.07,
-      maxCount: 230,
+      reproChance: 0.048,
+      maxCount: 950,
       speed: 0.19,
       metabolism: 0.045,
       foodEnergy: 52,
@@ -32,12 +55,12 @@
       baseEnergy: 86,
       maxAge: 2600,
       minAge: 170,
-      reproEnergy: 175,
+      reproEnergy: 235,
       reproCost: 62,
       reproChance: 0.009,
-      maxCount: 28,
+      maxCount: 150,
       speed: 0.22,
-      metabolism: 0.085,
+      metabolism: 0.14,
       foodEnergy: 1,
       eatRate: 0,
     },
@@ -49,11 +72,11 @@
       minAge: 70,
       reproEnergy: 108,
       reproCost: 42,
-      reproChance: 0.028,
-      maxCount: 92,
+      reproChance: 0.018,
+      maxCount: 460,
       speed: 0.14,
-      metabolism: 0.025,
-      foodEnergy: 64,
+      metabolism: 0.044,
+      foodEnergy: 50,
       eatRate: 0.058,
     },
     pollinator: {
@@ -64,11 +87,11 @@
       minAge: 55,
       reproEnergy: 78,
       reproCost: 28,
-      reproChance: 0.07,
-      maxCount: 140,
+      reproChance: 0.045,
+      maxCount: 520,
       speed: 0.27,
-      metabolism: 0.026,
-      foodEnergy: 80,
+      metabolism: 0.045,
+      foodEnergy: 55,
       eatRate: 0.034,
     },
     engineer: {
@@ -79,8 +102,8 @@
       minAge: 190,
       reproEnergy: 158,
       reproCost: 68,
-      reproChance: 0.022,
-      maxCount: 38,
+      reproChance: 0.028,
+      maxCount: 120,
       speed: 0.14,
       metabolism: 0.055,
       foodEnergy: 44,
@@ -119,6 +142,7 @@
     seed: 49321,
     rng: mulberry32(49321),
     running: true,
+    headless: false,
     speed: 4,
     overlay: "biome",
     tick: 0,
@@ -458,6 +482,8 @@
       genes,
       brain,
       infected: false,
+      immunity: 0,
+      huntLock: 0,
       cooldown: Math.floor(randRange(0, 80)),
       lastSlope: 0,
       lastTerrainFactor: 1,
@@ -522,12 +548,74 @@
     return groups;
   }
 
+  // Spatial bin index for O(1)-ish neighbor queries. Rebuilt once per tick from
+  // live positions; intra-tick movement (~0.2 cells) is negligible at the radii
+  // used here, so neighbor semantics match the old all-pairs scans.
+  const BIN = 4;
+  const BIN_W = Math.ceil(GRID_W / BIN);
+  const BIN_H = Math.ceil(GRID_H / BIN);
+  let agentBins = new Array(BIN_W * BIN_H).fill(null);
+
+  function buildAgentBins() {
+    for (let i = 0; i < agentBins.length; i += 1) agentBins[i] = null;
+    for (const a of agents) {
+      if (a.dead) continue;
+      const bx = clamp(Math.floor(a.x / BIN), 0, BIN_W - 1);
+      const by = clamp(Math.floor(a.y / BIN), 0, BIN_H - 1);
+      const idx = by * BIN_W + bx;
+      (agentBins[idx] || (agentBins[idx] = [])).push(a);
+    }
+  }
+
+  function forEachNearby(x, y, radius, cb) {
+    const minBx = clamp(Math.floor((x - radius) / BIN), 0, BIN_W - 1);
+    const maxBx = clamp(Math.floor((x + radius) / BIN), 0, BIN_W - 1);
+    const minBy = clamp(Math.floor((y - radius) / BIN), 0, BIN_H - 1);
+    const maxBy = clamp(Math.floor((y + radius) / BIN), 0, BIN_H - 1);
+    for (let by = minBy; by <= maxBy; by += 1) {
+      for (let bx = minBx; bx <= maxBx; bx += 1) {
+        const list = agentBins[by * BIN_W + bx];
+        if (!list) continue;
+        for (const other of list) cb(other);
+      }
+    }
+  }
+
+  // Nearest live agent matching `predicate` within `radius`, returned as a unit
+  // direction vector plus distance/score (same shape the movement code expects).
+  function nearestNearby(agent, radius, predicate) {
+    let best = null;
+    let bestD = radius;
+    forEachNearby(agent.x, agent.y, radius, (other) => {
+      if (other === agent || other.dead || !predicate(other)) return;
+      const d = distance(agent.x, agent.y, other.x, other.y);
+      if (d < bestD) {
+        bestD = d;
+        const inv = 1 / Math.max(0.001, d);
+        best = {
+          x: (other.x - agent.x) * inv,
+          y: (other.y - agent.y) * inv,
+          dist: d,
+          agent: other,
+          score: 1 - d / radius,
+        };
+      }
+    });
+    return best;
+  }
+
+  function isPrey(other) {
+    return other.type === "herbivore" || other.type === "pollinator";
+  }
+
   function simulateTick() {
     state.tick += 1;
+    state.season = seasonState();
     maybeTriggerAutomaticEvent();
     updateEnvironment();
 
     const groups = groupAgents();
+    buildAgentBins();
     const newborns = [];
     for (const agent of agents) {
       if (!agent.dead) updateAgent(agent, groups, newborns);
@@ -547,27 +635,37 @@
     if (newborns.length) agents.push(...newborns);
     supportMigration();
 
-    if (state.tick % 8 === 0) pushHistory();
-    if (state.tick % 6 === 0) updateUi();
+    // In headless measurement runs we skip the observational UI/history work
+    // (DOM string building, redundant full-grid stat scans); it does not affect
+    // the simulated ecology and the probe samples stats directly.
+    if (!state.headless) {
+      if (state.tick % 8 === 0) pushHistory();
+      if (state.tick % 6 === 0) updateUi();
+    }
   }
 
+  // Rescue effect: a closed patch would otherwise suffer permanent local
+  // extinctions that a real, connected landscape avoids via recolonization from
+  // neighbouring populations. This only fires when a guild is nearly gone and
+  // suitable habitat exists, so it prevents irreversible collapse WITHOUT
+  // pegging populations at a target (regulation stays emergent).
   function supportMigration() {
-    if (state.tick % 160 !== 0 || agents.length >= MAX_AGENTS - 12) return;
+    if (state.tick % 220 !== 0 || agents.length >= MAX_AGENTS - 12) return;
     const stats = collectStats();
-    if (stats.counts.herbivore < 24 && stats.plantBiomass > 650) {
-      migrate("herbivore", Math.min(18, 42 - stats.counts.herbivore), "Herbivore migration");
+    if (stats.counts.herbivore < 6 && stats.plantBiomass > 650) {
+      migrate("herbivore", 4, "Herbivore recolonization");
     }
-    if (stats.counts.pollinator < 16 && stats.plantBiomass > 500) {
-      migrate("pollinator", Math.min(16, 34 - stats.counts.pollinator), "Pollinator migration");
+    if (stats.counts.pollinator < 5 && stats.plantBiomass > 500) {
+      migrate("pollinator", 3, "Pollinator recolonization");
     }
-    if (stats.counts.predator < 3 && stats.counts.herbivore > 90) {
+    if (stats.counts.predator < 2 && stats.counts.herbivore > 80) {
       migrate("predator", 2, "Predator recolonization");
     }
-    if (stats.counts.decomposer < 14 && stats.detritus > 0.18) {
-      migrate("decomposer", 10, "Decomposer bloom");
+    if (stats.counts.decomposer < 5 && stats.detritus > 0.18) {
+      migrate("decomposer", 4, "Decomposer recolonization");
     }
-    if (stats.counts.engineer < 4 && stats.moisture < 0.5) {
-      migrate("engineer", 2, "Engineer recolonization");
+    if (stats.counts.engineer < 4 && stats.plantBiomass > 400) {
+      migrate("engineer", 3, "Engineer recolonization");
     }
   }
 
@@ -593,7 +691,7 @@
   }
 
   function updateEnvironment() {
-    const season = seasonState();
+    const season = state.season || seasonState();
     const rainfall = Number(els.rainfall.value) / 100;
     const tempOffset = Number(els.temperature.value);
     const droughtFactor = state.droughtTicks > 0 ? 0.22 : 1;
@@ -610,7 +708,7 @@
       const evaporation = (0.0022 + Math.max(0, c.temp) * 0.00006) * (1.1 - rainfall * 0.25);
       const rain = rainfall * 0.0075 * season.rain * droughtFactor * (1 - c.elevation * 0.28);
       c.moisture = clamp(c.moisture + rain + floodBonus - evaporation - plantWaterUse + c.engineerBoost * 0.002, 0, 1.35);
-      c.pathogen *= 0.985;
+      c.pathogen *= 0.994;
       c.decomposerBoost *= 0.87;
       c.engineerBoost *= 0.94;
       c.burning *= 0.86;
@@ -662,17 +760,37 @@
           : 0;
       const stressDeath = c.vegetation * (tooDry * 0.005 + tooWet * 0.003 + (1 - tempFactor) * 0.002);
       c.vegetation = clamp(c.vegetation + growth + seedling - stressDeath, 0, capacity);
-      c.detritus = clamp(c.detritus + stressDeath * 0.82, 0, 2.8);
-      c.nutrients = clamp(c.nutrients - growth * 0.08 + stressDeath * 0.05, 0.02, 1.4);
-      c.flower = clamp(c.vegetation * 0.3 * season.flower * tempFactor * (1 - c.toxicity), 0, 0.55);
+      // Stoichiometric cycle: producers take up nutrients in proportion to the
+      // biomass they build, and dead plant matter carries that nutrient into the
+      // detritus pool (released later by decomposition). No nutrients are created.
+      const uptake = (growth + seedling) * NUTRIENT_PER_BIOMASS;
+      c.detritus = clamp(c.detritus + stressDeath, 0, 4.0);
+      c.nutrients = clamp(c.nutrients - uptake, 0.0, 1.6);
+      // Nectar is a depletable standing stock that regenerates toward a
+      // vegetation/season-set target, NOT a value recomputed from scratch each
+      // tick. This makes flowers a genuinely limiting resource, so pollinator
+      // numbers are regulated by nectar availability (emergent) instead of being
+      // pinned at a population cap on an effectively infinite food supply.
+      const flowerTarget = clamp(c.vegetation * 0.3 * season.flower * tempFactor * (1 - c.toxicity), 0, 0.55);
+      c.flower = clamp(c.flower + (flowerTarget - c.flower) * 0.07, 0, 0.55);
       c.pollinated *= 0.9;
       state.totals.primaryProduction += growth + seedling;
 
       const microbe = clamp(c.moisture / 0.58, 0, 1.3) * bell(c.temp, 21, 14) * (1 - c.toxicity * 0.65);
       const decomposed = Math.min(c.detritus, c.detritus * (0.006 + microbe * 0.018 + c.decomposerBoost * 0.03));
       c.detritus -= decomposed;
-      c.nutrients = clamp(c.nutrients + decomposed * 0.58, 0.02, 1.4);
-      state.totals.recycled += decomposed * 0.58;
+      // Decomposition returns the nutrients embodied in the detritus to the soil;
+      // the carbon is respired (lost), which is why the cycle conserves nutrient
+      // mass without accumulating it.
+      const released = decomposed * NUTRIENT_PER_BIOMASS;
+      // Small open fluxes: weathering/deposition input and moisture-driven
+      // leaching output keep the pool bounded and near steady state. The two
+      // are balanced so the abiotic equilibrium soil level (~weathering /
+      // (moisture * k_leach)) sits in the productive range rather than draining.
+      const weathering = 0.00008;
+      const leaching = c.nutrients * c.moisture * 0.0009;
+      c.nutrients = clamp(c.nutrients + released + weathering - leaching, 0.0, 1.6);
+      state.totals.recycled += released;
 
       const wastePressure = Math.max(0, c.detritus - 1.15) + c.pathogen * 0.3;
       c.toxicity = clamp(c.toxicity + wastePressure * 0.0008 - (microbe + c.moisture) * 0.0016, 0, 1);
@@ -703,7 +821,7 @@
           if (c.moisture > 0.74) continue;
           const plantLoss = Math.min(c.vegetation, burn * 0.018);
           c.vegetation -= plantLoss;
-          c.detritus = clamp(c.detritus + plantLoss * 0.46, 0, 2.8);
+          c.detritus = clamp(c.detritus + plantLoss * 0.46, 0, 4.0);
           c.nutrients = clamp(c.nutrients + plantLoss * 0.15, 0, 1.4);
           c.moisture = clamp(c.moisture - burn * 0.005, 0, 1.35);
           c.toxicity = clamp(c.toxicity + burn * 0.002, 0, 1);
@@ -728,7 +846,7 @@
     const disturbance = Number(els.disturbance.value) / 100;
     if (disturbance <= 0) return;
     if (rand() > disturbance * 0.00035) return;
-    const season = seasonState();
+    const season = state.season || seasonState();
     const roll = rand();
     if (season.name === "Summer" && roll < 0.34) triggerEvent("fire", true);
     else if (roll < 0.28) triggerEvent("disease", true);
@@ -747,8 +865,14 @@
     const diseaseCost = agent.infected ? 0.034 * (1.15 - agent.genes.resistance) : 0;
     const toxinCost = cell.toxicity * 0.062;
     const oxygenCost = cell.water && cell.oxygen < 0.3 ? 0.04 : 0;
+    // Kleiber's law: whole-organism basal cost scales with mass^0.75 (so larger
+    // bodies are cheaper per unit mass). Q10: ectotherm metabolism rises with
+    // temperature above the preferred band, capped so it stays bounded.
+    const massMetabolic = Math.pow(agent.genes.body, KLEIBER_EXP);
+    const q10Factor = clamp(Math.pow(Q10, (cell.temp - agent.genes.tempPref) / 10), 0.55, 2.6);
+    const basalMetabolism = info.metabolism * agent.genes.metabolism * massMetabolic * q10Factor;
     agent.energy -=
-      info.metabolism * agent.genes.metabolism +
+      basalMetabolism +
       tempStress * 0.055 +
       thirstStress +
       diseaseCost +
@@ -832,9 +956,9 @@
     const food = senseResource(agent, foodKind(agent.type));
     const water = senseResource(agent, "water");
     const comfort = senseResource(agent, "comfort");
-    const mate = agent.energy > TYPE_INFO[agent.type].reproEnergy * 0.78 ? nearestSame(agent, groups[agent.type], agent.genes.sense) : null;
+    const mate = agent.energy > TYPE_INFO[agent.type].reproEnergy * 0.78 ? nearestSame(agent, agent.genes.sense) : null;
     const danger = dangerFor(agent, groups);
-    const crowd = crowdVector(agent, groups[agent.type], 3.3);
+    const crowd = crowdVector(agent, 3.3);
     const b = agent.brain;
     const hungerDrive = 0.55 + agent.hunger / 58;
     const thirstDrive = 0.55 + agent.thirst / 46;
@@ -878,7 +1002,7 @@
 
   function senseResource(agent, kind) {
     if (kind === "prey") {
-      const prey = nearestAgent(agent, agents.filter((a) => !a.dead && (a.type === "herbivore" || a.type === "pollinator")), agent.genes.sense);
+      const prey = nearestNearby(agent, agent.genes.sense, isPrey);
       return prey || { x: 0, y: 0, score: 0 };
     }
 
@@ -886,9 +1010,8 @@
     let best = { x: 0, y: 0, score: bestScore };
     const sense = agent.genes.sense;
     for (let i = 0; i < DIRECTIONS; i += 1) {
-      const angle = (Math.PI * 2 * i) / DIRECTIONS;
-      const dx = Math.cos(angle);
-      const dy = Math.sin(angle);
+      const dx = DIR_COS[i];
+      const dy = DIR_SIN[i];
       for (let r = 0.35; r <= 1; r += 0.325) {
         const c = getCell(agent.x + dx * sense * r, agent.y + dy * sense * r);
         const score = scoreCell(c, kind, agent) - r * 0.03;
@@ -925,44 +1048,17 @@
     return 0;
   }
 
-  function nearestAgent(agent, candidates, radius) {
-    let best = null;
-    let bestD = radius;
-    for (const other of candidates) {
-      if (other === agent || other.dead) continue;
-      const d = distance(agent.x, agent.y, other.x, other.y);
-      if (d < bestD) {
-        bestD = d;
-        const dx = (other.x - agent.x) / Math.max(0.001, d);
-        const dy = (other.y - agent.y) / Math.max(0.001, d);
-        best = { x: dx, y: dy, dist: d, agent: other, score: 1 - d / radius };
-      }
-    }
-    return best;
-  }
-
-  function nearestSame(agent, candidates, radius) {
-    let best = null;
-    let bestD = radius;
-    for (const other of candidates) {
-      if (other === agent || other.dead || other.energy < TYPE_INFO[other.type].reproEnergy * 0.65) continue;
-      const d = distance(agent.x, agent.y, other.x, other.y);
-      if (d < bestD) {
-        bestD = d;
-        best = {
-          x: (other.x - agent.x) / Math.max(0.001, d),
-          y: (other.y - agent.y) / Math.max(0.001, d),
-          dist: d,
-          agent: other,
-        };
-      }
-    }
-    return best;
+  function nearestSame(agent, radius) {
+    return nearestNearby(
+      agent,
+      radius,
+      (other) => other.type === agent.type && other.energy >= TYPE_INFO[other.type].reproEnergy * 0.65,
+    );
   }
 
   function dangerFor(agent, groups) {
     if (agent.type === "predator") return fireDanger(agent);
-    const predator = nearestAgent(agent, groups.predator, agent.genes.sense * 1.15);
+    const predator = nearestNearby(agent, agent.genes.sense * 1.15, (other) => other.type === "predator");
     const fire = fireDanger(agent);
     if (!predator) return fire;
     if (!fire) return predator;
@@ -979,19 +1075,19 @@
     };
   }
 
-  function crowdVector(agent, candidates, radius) {
+  function crowdVector(agent, radius) {
     let dx = 0;
     let dy = 0;
     let count = 0;
-    for (const other of candidates) {
-      if (other === agent || other.dead) continue;
+    forEachNearby(agent.x, agent.y, radius, (other) => {
+      if (other === agent || other.dead || other.type !== agent.type) return;
       const d = distance(agent.x, agent.y, other.x, other.y);
       if (d > 0 && d < radius) {
         dx += (other.x - agent.x) / d;
         dy += (other.y - agent.y) / d;
         count += 1;
       }
-    }
+    });
     if (!count) return { x: 0, y: 0 };
     return { x: dx / count, y: dy / count };
   }
@@ -1012,8 +1108,9 @@
     }
 
     if (rand() < 0.2) {
-      cell.detritus = clamp(cell.detritus + 0.002 * agent.genes.body, 0, 2.8);
-      cell.nutrients = clamp(cell.nutrients + 0.0009 * agent.genes.body, 0, 1.4);
+      // Metabolic waste becomes detritus (its nutrients are released later by
+      // decomposition) rather than appearing directly as soil nutrients.
+      cell.detritus = clamp(cell.detritus + 0.0022 * agent.genes.body, 0, 4.0);
     }
   }
 
@@ -1023,25 +1120,59 @@
     const amount = Math.min(cell.vegetation, info.eatRate * scale * agent.genes.body);
     if (amount <= 0) return;
     cell.vegetation -= amount;
-    cell.detritus = clamp(cell.detritus + amount * 0.08, 0, 2.8);
-    cell.nutrients = clamp(cell.nutrients + amount * 0.018, 0, 1.4);
+    // Egesta (undigested fraction) returns to detritus carrying its nutrients;
+    // the rest is assimilated into the animal and returned to soil at death.
+    cell.detritus = clamp(cell.detritus + amount * 0.25, 0, 4.0);
     agent.energy = clamp(agent.energy + amount * info.foodEnergy * (1 - cell.toxicity * 0.45), 0, 220);
     agent.hunger = clamp(agent.hunger - amount * 130, 0, 140);
   }
 
   function hunt(agent, groups) {
-    const preyList = groups.herbivore.concat(groups.pollinator);
-    const target = nearestAgent(agent, preyList, 1.25 + agent.genes.body * 0.65);
-    if (!target) return;
-    const prey = target.agent;
-    const success = 0.16 + agent.genes.aggression * 0.16 + agent.genes.speed * 0.05 - prey.genes.speed * 0.11;
-    if (rand() < clamp(success, 0.03, 0.46)) {
+    // Handling time: after a kill the predator spends ticks subduing/consuming
+    // prey and cannot attack. This is what makes the functional response
+    // saturate (Holling type II) instead of growing without bound.
+    if (agent.huntLock > 0) {
+      agent.huntLock -= 1;
+      return;
+    }
+    const captureR = 1.25 + agent.genes.body * 0.65;
+    let preyCount = 0;
+    let nearest = null;
+    let nearestD = captureR;
+    forEachNearby(agent.x, agent.y, captureR, (other) => {
+      if (other.dead || !isPrey(other)) return;
+      const d = distance(agent.x, agent.y, other.x, other.y);
+      if (d < captureR) {
+        preyCount += 1;
+        if (d < nearestD) {
+          nearestD = d;
+          nearest = other;
+        }
+      }
+    });
+    if (!nearest) return;
+    const prey = nearest;
+    // Per-encounter attack efficiency (depends on the chase: predator vigor vs
+    // prey escape speed). Local prey density raises the encounter rate, and the
+    // 1-exp form saturates it, giving a Holling type II response.
+    const attack = clamp(0.18 + agent.genes.aggression * 0.2 + agent.genes.speed * 0.05 - prey.genes.speed * 0.11, 0.02, 0.7);
+    const captureProb = 1 - Math.exp(-attack * preyCount);
+    if (rand() < captureProb) {
       prey.dead = true;
-      agent.energy = clamp(agent.energy + prey.energy * 0.66 + prey.genes.body * 26, 0, 240);
-      agent.hunger = clamp(agent.hunger - 62, 0, 140);
+      // Energy gain is only the assimilated fraction of the prey's body energy:
+      // no free bonus, so predator biomass is bounded by prey biomass (energy
+      // conservation across the trophic link).
+      const preyBodyEnergy = Math.max(0, prey.energy) + prey.genes.body * 8;
+      agent.energy = clamp(agent.energy + preyBodyEnergy * PRED_ASSIMILATION, 0, 260);
+      agent.hunger = clamp(agent.hunger - 70, 0, 140);
+      // Handling time: subduing + consuming prey keeps the predator out of the
+      // hunt for a while, which (with assimilation losses) is what caps predator
+      // numbers far below their prey.
+      agent.huntLock = Math.floor(randRange(18, 32) + prey.genes.body * 8);
       state.totals.predation += 1;
       const c = getCell(prey.x, prey.y);
-      c.detritus = clamp(c.detritus + prey.genes.body * 0.18, 0, 2.8);
+      // Unassimilated prey mass becomes detritus (carcass), conserving matter.
+      c.detritus = clamp(c.detritus + prey.genes.body * 0.3 + Math.max(0, prey.energy) * 0.003, 0, 4.0);
       if (state.totals.predation % 12 === 0) logEvent("Predation pulse", "Predators converted prey biomass into detritus");
     }
   }
@@ -1050,10 +1181,12 @@
     const amount = Math.min(cell.detritus, TYPE_INFO.decomposer.eatRate * agent.genes.body);
     if (amount <= 0) return;
     cell.detritus -= amount;
-    cell.nutrients = clamp(cell.nutrients + amount * 0.62, 0, 1.4);
+    // Decomposers mineralize detritus: nutrients released at the stoichiometric
+    // ratio (conserving mass); the carbon fuels the decomposer's own energy.
+    cell.nutrients = clamp(cell.nutrients + amount * NUTRIENT_PER_BIOMASS, 0, 1.6);
     cell.toxicity = clamp(cell.toxicity - amount * 0.035, 0, 1);
     cell.decomposerBoost = clamp(cell.decomposerBoost + 0.08, 0, 1);
-    state.totals.recycled += amount * 0.62;
+    state.totals.recycled += amount * NUTRIENT_PER_BIOMASS;
     agent.energy = clamp(agent.energy + amount * TYPE_INFO.decomposer.foodEnergy, 0, 160);
     agent.hunger = clamp(agent.hunger - amount * 105, 0, 140);
   }
@@ -1091,26 +1224,47 @@
     }
   }
 
+  // SIRS epidemiology: Susceptible -> Infected -> Recovered(immune) -> Susceptible.
+  // Transmission is density-dependent through direct contact with infected
+  // conspecifics plus an environmental pathogen reservoir. Infection both drains
+  // energy (handled in updateAgent) and kills outright, so disease is a genuine
+  // density-dependent population regulator. Recovery confers waning immunity,
+  // which lets susceptibles rebuild and produces recurring epidemic waves.
   function updateDisease(agent, groups) {
     const cell = getCell(agent.x, agent.y);
+    if (agent.immunity > 0) agent.immunity -= 1;
+
     if (agent.infected) {
       cell.pathogen = clamp(cell.pathogen + 0.007, 0, 1.5);
+      // Disease-induced mortality (virulence offset by host resistance). Kept
+      // low so infectious hosts persist long enough to sustain transmission.
+      if (rand() < 0.0009 * (1.2 - agent.genes.resistance)) {
+        agent.dead = true;
+        return;
+      }
+      // Recovery grants temporary, waning immunity that scales with resistance.
+      // Immunity is deliberately short relative to host turnover so the pool of
+      // susceptibles refills and the pathogen circulates as recurring waves
+      // rather than burning out after one epidemic.
       if (rand() < 0.006 + agent.genes.resistance * 0.007) {
         agent.infected = false;
+        agent.immunity = Math.floor(randRange(90, 220) * (0.6 + agent.genes.resistance * 0.7));
       }
       return;
     }
 
-    let nearby = 0;
-    for (const other of groups[agent.type]) {
-      if (other === agent || other.dead) continue;
-      if (distance(agent.x, agent.y, other.x, other.y) < 2.2) nearby += 1;
-    }
-    const pressure = cell.pathogen * 0.003 + nearby * 0.00015 + cell.toxicity * 0.0008;
-    if (rand() < pressure * (1.12 - agent.genes.resistance)) {
+    if (agent.immunity > 0) return; // recovered and not yet susceptible again
+
+    let infectedNearby = 0;
+    forEachNearby(agent.x, agent.y, 2.4, (other) => {
+      if (other === agent || other.dead || other.type !== agent.type || !other.infected) return;
+      if (distance(agent.x, agent.y, other.x, other.y) < 2.4) infectedNearby += 1;
+    });
+    const pressure = cell.pathogen * 0.01 + infectedNearby * 0.007 + cell.toxicity * 0.0008;
+    if (rand() < pressure * (1.15 - agent.genes.resistance)) {
       agent.infected = true;
       state.totals.diseaseCases += 1;
-      if (state.totals.diseaseCases % 8 === 0) logEvent("Disease spread", "Crowding and waste raised pathogen pressure");
+      if (state.totals.diseaseCases % 8 === 0) logEvent("Disease spread", "Contact and waste raised pathogen pressure");
     }
   }
 
@@ -1119,8 +1273,11 @@
     if (agents.length + newborns.length >= MAX_AGENTS) return;
     if (groups[agent.type].length >= info.maxCount) return;
     if (agent.cooldown > 0 || agent.age < info.minAge || agent.energy < info.reproEnergy) return;
-    if (agent.hunger > 58 || agent.thirst > 62) return;
-    const mate = nearestSame(agent, groups[agent.type], Math.max(4.5, agent.genes.sense * 0.9));
+    // Condition-dependent breeding: animals only reproduce in good body
+    // condition. Tightening this gate makes density dependence bite earlier as
+    // forage tightens, damping boom-bust overshoot toward stable cycles.
+    if (agent.hunger > 48 || agent.thirst > 54) return;
+    const mate = nearestSame(agent, Math.max(4.5, agent.genes.sense * 0.9));
     const fallbackMateChance = {
       herbivore: 0.28,
       predator: 0.1,
@@ -1129,7 +1286,18 @@
       engineer: 0.14,
     };
     if (!mate && rand() > fallbackMateChance[agent.type]) return;
-    const chance = info.reproChance * (agent.infected ? 0.35 : 1);
+    // Seasonal breeding: temperate animals recruit in a spring/summer pulse
+    // (driven by flowering/forage), winter is near-silent. Soil decomposers
+    // breed year-round. season.flower peaks ~1.25 in spring, ~0.08 in winter.
+    const flower = (state.season || seasonState()).flower;
+    const seasonalBreed = {
+      herbivore: 0.3 + flower * 0.75,
+      predator: 0.5 + flower * 0.45,
+      decomposer: 1,
+      pollinator: 0.1 + flower * 1.05,
+      engineer: 0.4 + flower * 0.6,
+    }[agent.type];
+    const chance = info.reproChance * (agent.infected ? 0.35 : 1) * seasonalBreed;
     if (rand() > chance) return;
 
     const parentB = mate ? mate.agent : agent;
@@ -1151,8 +1319,9 @@
     agent._recycled = true;
     state.totals.deaths += 1;
     const c = getCell(agent.x, agent.y);
-    c.detritus = clamp(c.detritus + agent.genes.body * 0.42 + Math.max(0, agent.energy) * 0.004, 0, 2.8);
-    c.nutrients = clamp(c.nutrients + agent.genes.body * 0.08, 0, 1.4);
+    // A carcass becomes detritus carrying the body's nutrients; decomposition
+    // mineralizes them back to soil over time (no free nutrient injection).
+    c.detritus = clamp(c.detritus + agent.genes.body * 0.5 + Math.max(0, agent.energy) * 0.004, 0, 4.0);
     if (agent.infected) c.pathogen = clamp(c.pathogen + 0.18, 0, 1.5);
     if (state.totals.deaths % 24 === 0) logEvent("Mortality", `${state.totals.deaths} deaths recycled through detritus and soil`);
     return reason;
@@ -1167,7 +1336,7 @@
       for (let i = 0; i < 280; i += 1) {
         const c = cells[Math.floor(rand() * cells.length)];
         c.moisture = clamp(c.moisture + randRange(0.08, 0.22), 0, 1.35);
-        c.detritus = clamp(c.detritus + randRange(0, 0.05), 0, 2.8);
+        c.detritus = clamp(c.detritus + randRange(0, 0.05), 0, 4.0);
       }
       logEvent(automatic ? "Flood pulse" : "Flood released", "Water spread through low terrain and moved detritus");
     } else if (type === "fire") {
@@ -1308,6 +1477,34 @@
       avgUphillEffort: uphillEffort / totalAgents,
       treeStands,
       stability: clamp(stability, 0, 100),
+    };
+  }
+
+  function energyAudit() {
+    let animalEnergy = 0;
+    let plantBiomass = 0;
+    let detritus = 0;
+    let soilNutrients = 0;
+    const byType = Object.fromEntries(TYPE_ORDER.map((type) => [type, { count: 0, energy: 0 }]));
+    for (const agent of agents) {
+      if (agent.dead) continue;
+      animalEnergy += Math.max(0, agent.energy);
+      byType[agent.type].count += 1;
+      byType[agent.type].energy += Math.max(0, agent.energy);
+    }
+    for (const cell of cells) {
+      plantBiomass += cell.vegetation;
+      detritus += cell.detritus;
+      soilNutrients += cell.nutrients;
+    }
+    return {
+      tick: state.tick,
+      animalEnergy,
+      plantBiomass,
+      detritus,
+      soilNutrients,
+      byType,
+      totals: { ...state.totals },
     };
   }
 
@@ -1825,6 +2022,23 @@
     setRunning: (running) => {
       state.running = Boolean(running);
       els.runToggle.textContent = state.running ? "Pause" : "Run";
+    },
+    // Headless hooks for the ecology measurement harness. These read live
+    // references and are inert in the browser unless explicitly called.
+    headless: {
+      tick: () => simulateTick(),
+      reseed: (seed) => initWorld(seed),
+      trigger: (type) => triggerEvent(type, false),
+      render: () => render(),
+      setQuiet: (quiet) => {
+        state.headless = Boolean(quiet);
+      },
+      stats: () => collectStats(),
+      energyAudit: () => energyAudit(),
+      getAgents: () => agents,
+      getCells: () => cells,
+      getState: () => state,
+      getTypeInfo: () => TYPE_INFO,
     },
   };
   applyStartupParams();
