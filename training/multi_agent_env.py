@@ -63,24 +63,25 @@ SPECIES_PARAMS: list[dict] = [
         repro_energy=100.0, repro_cost=35.0, repro_chance=0.045,
         eat_rate=0.06, food_energy=48.0, max_count=420, init_count=80,
     ),
-    # PREDATOR — attack & assimilation tuned down so prey can survive long
-    # enough to LEARN to flee; otherwise predator policy converges to "kill
-    # everything" before prey policies converge to "avoid predators" and the
-    # whole system collapses (Red-Queen instability). After 200 updates the
-    # predator policy still hit 0% reproduction in greedy eval: each
-    # successful kill yields ~10 energy and basal metabolism burns ~0.16/tick
-    # so reaching repro_energy=140 took more successful kill cycles than the
-    # greedy policy could string together inside a 600-tick episode. Now:
-    # repro_energy 140 -> 110 (need ~4 kill cycles instead of ~9), metabolism
-    # 0.16 -> 0.13 (less energy bled between kills). Also gives predator
-    # looser hunger/thirst gates for reproduction (set in _do_reproduction)
-    # since obligate carnivores don't naturally require well-hydrated state
-    # to breed.
+    # PREDATOR. Iterative tuning history:
+    # - Round 1 (first multi-agent run): predator reward dominated by sparse
+    #   kills; 0% repro in greedy eval.
+    # - Round 2: lowered repro_energy 140->110, metabolism 0.16->0.13, added
+    #   per-species looser hunger/thirst repro gates. Predator repro reached
+    #   1.6% but prey simultaneously learned to flee (pollinator speed 0.95,
+    #   wider threat radius) and predator food signal COLLAPSED from 63% to
+    #   33% — classic Red Queen, prey side won.
+    # - Round 3 (this): predator pursuit upgrades so they can keep up with
+    #   smarter prey. Speed 0.65 -> 0.85 (still under pollinator's 0.95 so
+    #   the prey advantage is preserved), attack 0.22 -> 0.28 (higher per-
+    #   encounter success), capture_radius 1.4 -> 1.55 (slightly more
+    #   forgiving). Assimilation deliberately left at 0.17 to keep the
+    #   Lindeman energy pyramid in its ~10-20% target band.
     dict(
-        speed=0.65, metabolism=0.13, base_energy=86.0, min_age=70, max_age=1300,
+        speed=0.85, metabolism=0.13, base_energy=86.0, min_age=70, max_age=1300,
         repro_energy=110.0, repro_cost=38.0, repro_chance=0.022,
         eat_rate=0.0, food_energy=0.0, max_count=80, init_count=14,
-        attack=0.22, handling_min=22, handling_max=40, capture_radius=1.4,
+        attack=0.28, handling_min=22, handling_max=40, capture_radius=1.55,
         assimilation=0.17,
     ),
     # DECOMPOSER
@@ -479,10 +480,16 @@ class World:
         obs[:, 22] = water_dy
         obs[:, 23] = water_score
 
-        # Predator sense: prey species (HERB, POLL) see direction & proximity
-        # of the nearest predator. Predators get zeros (they have no predator).
+        # Predator/prey awareness slot. Prey species (HERB, POLL) see the
+        # direction & proximity of the nearest PREDATOR (threat). Predators
+        # see the direction & proximity of the nearest PREY (target) — this
+        # was missing before round 3 and is why predators were essentially
+        # foraging blind, relying on vegetation as a proxy for prey location.
+        # Other species get zeros (irrelevant).
         if species in PREY_SPECIES:
             pdx, pdy, pscore = self._sense_predators(x, y)
+        elif species == PREDATOR:
+            pdx, pdy, pscore = self._sense_prey(x, y)
         else:
             pdx = np.zeros(slots.size)
             pdy = np.zeros(slots.size)
@@ -534,6 +541,27 @@ class World:
         best_dy = offs[bi, 1]
         best_score = np.clip(flat[np.arange(n), best], 0.0, 1.0)
         return best_dx, best_dy, best_score
+
+    def _sense_prey(self, ax: np.ndarray, ay: np.ndarray):
+        """Predator-only: direction & proximity of nearest prey. Mirror of
+        _sense_predators (which prey use to see the nearest predator), but
+        from the hunter's perspective."""
+        prey_slots = np.where(self.alive & ((self.type == HERBIVORE) | (self.type == POLLINATOR)))[0]
+        if prey_slots.size == 0:
+            return np.zeros(ax.size), np.zeros(ax.size), np.zeros(ax.size)
+        qx = self.x[prey_slots]
+        qy = self.y[prey_slots]
+        dx = qx[None, :] - ax[:, None]
+        dy = qy[None, :] - ay[:, None]
+        d2 = dx * dx + dy * dy
+        nearest = np.argmin(d2, axis=1)
+        d = np.sqrt(d2[np.arange(ax.size), nearest])
+        dir_x = np.where(d > 1e-6, dx[np.arange(ax.size), nearest] / np.maximum(d, 1e-6), 0.0)
+        dir_y = np.where(d > 1e-6, dy[np.arange(ax.size), nearest] / np.maximum(d, 1e-6), 0.0)
+        # Closer prey = higher value. Same 18-cell saturation as the threat
+        # signal so the network can repurpose the same circuitry per species.
+        score = np.clip(1.0 - d / 18.0, 0.0, 1.0)
+        return dir_x, dir_y, score
 
     def _sense_predators(self, ax: np.ndarray, ay: np.ndarray):
         pred_slots = np.where(self.alive & (self.type == PREDATOR))[0]
