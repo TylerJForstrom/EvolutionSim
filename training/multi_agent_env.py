@@ -66,14 +66,19 @@ SPECIES_PARAMS: list[dict] = [
     # PREDATOR — attack & assimilation tuned down so prey can survive long
     # enough to LEARN to flee; otherwise predator policy converges to "kill
     # everything" before prey policies converge to "avoid predators" and the
-    # whole system collapses (Red-Queen instability). Repro gates further
-    # loosened (energy 180 -> 140, cost 55 -> 40) because the breakdown log
-    # showed predators essentially never reproducing in greedy eval — they
-    # weren't accumulating enough energy on partial-success hunts to clear
-    # the repro_energy gate before something killed them.
+    # whole system collapses (Red-Queen instability). After 200 updates the
+    # predator policy still hit 0% reproduction in greedy eval: each
+    # successful kill yields ~10 energy and basal metabolism burns ~0.16/tick
+    # so reaching repro_energy=140 took more successful kill cycles than the
+    # greedy policy could string together inside a 600-tick episode. Now:
+    # repro_energy 140 -> 110 (need ~4 kill cycles instead of ~9), metabolism
+    # 0.16 -> 0.13 (less energy bled between kills). Also gives predator
+    # looser hunger/thirst gates for reproduction (set in _do_reproduction)
+    # since obligate carnivores don't naturally require well-hydrated state
+    # to breed.
     dict(
-        speed=0.65, metabolism=0.16, base_energy=86.0, min_age=70, max_age=1300,
-        repro_energy=140.0, repro_cost=40.0, repro_chance=0.022,
+        speed=0.65, metabolism=0.13, base_energy=86.0, min_age=70, max_age=1300,
+        repro_energy=110.0, repro_cost=38.0, repro_chance=0.022,
         eat_rate=0.0, food_energy=0.0, max_count=80, init_count=14,
         attack=0.22, handling_min=22, handling_max=40, capture_radius=1.4,
         assimilation=0.17,
@@ -87,9 +92,13 @@ SPECIES_PARAMS: list[dict] = [
     # POLLINATOR — eat_rate raised because the breakdown showed pollinators
     # earning only 1.3% of their reward from food; they were dying of
     # condition penalty (41%) and threat (24%) before they could harvest
-    # enough nectar to reproduce.
+    # enough nectar to reproduce. After 200 updates threat % was still 49%
+    # so speed bumped a notch more (predator speed is 0.65, pollinator 0.95
+    # gives reliable escape margin in unobstructed terrain) and the threat
+    # observation/reward terms below widened to give pollinators an earlier
+    # learning signal.
     dict(
-        speed=0.85, metabolism=0.045, base_energy=45.0, min_age=30, max_age=700,
+        speed=0.95, metabolism=0.045, base_energy=45.0, min_age=30, max_age=700,
         repro_energy=70.0, repro_cost=26.0, repro_chance=0.045,
         eat_rate=0.048, food_energy=55.0, max_count=260, init_count=40,
     ),
@@ -540,8 +549,11 @@ class World:
         d = np.sqrt(d2[np.arange(ax.size), nearest])
         dir_x = np.where(d > 1e-6, dx[np.arange(ax.size), nearest] / np.maximum(d, 1e-6), 0.0)
         dir_y = np.where(d > 1e-6, dy[np.arange(ax.size), nearest] / np.maximum(d, 1e-6), 0.0)
-        # Threat: closer = scarier. Saturate to 0 beyond ~12 cells.
-        score = np.clip(1.0 - d / 12.0, 0.0, 1.0)
+        # Threat awareness in OBSERVATION saturates at 18 cells (was 12) so
+        # prey species detect predators earlier and have time to flee before
+        # the threat REWARD penalty (which triggers at 10 cells, below) kicks
+        # in hard. Earlier signal = earlier learning of flee behavior.
+        score = np.clip(1.0 - d / 18.0, 0.0, 1.0)
         return dir_x, dir_y, score
 
     def _crowd_signal(self, species: int, slots: np.ndarray, ax: np.ndarray, ay: np.ndarray) -> np.ndarray:
@@ -861,9 +873,13 @@ class World:
         dx_all = self.x[prey_slots][None, :] - self.x[pred_slots][:, None]
         dy_all = self.y[prey_slots][None, :] - self.y[pred_slots][:, None]
         d_all = np.sqrt(dx_all * dx_all + dy_all * dy_all)  # (n_pred, n_prey)
-        # Prey threat = closeness of nearest predator within ~6 cells.
+        # Prey threat radius widened 6 -> 10 cells so the penalty turns on
+        # smoothly while prey can still escape. With the previous 6-cell
+        # cliff, by the time the threat penalty was meaningful the predator
+        # was already nearly in capture range and the prey policy had no
+        # chance to learn anticipatory avoidance.
         min_d_prey = np.min(d_all, axis=0)
-        threat = np.clip(1.0 - min_d_prey / 6.0, 0.0, 1.0)
+        threat = np.clip(1.0 - min_d_prey / 10.0, 0.0, 1.0)
         self._predator_threat[prey_slots] = threat
         # Predator stalk closeness = closeness of nearest prey within ~10
         # cells. Goes up smoothly as a predator approaches prey, giving the
@@ -927,7 +943,15 @@ class World:
         """Spawn new agents for those that meet condition gates. Returns
         the slot ids of the newborns (so the trainer can register them)."""
         new_slots: list[int] = []
-        # Per-species masks and gates.
+        # Per-species masks and gates. Predator uses looser hunger/thirst
+        # condition gates because (a) obligate carnivores don't biologically
+        # require well-hydrated state to breed and (b) keeping the prey
+        # default at 55/60 forced the predator's greedy policy to choose
+        # between hunting (which keeps thirst above 60) and breeding — so it
+        # never bred in eval. Per-species thresholds let predators reproduce
+        # right after a successful kill.
+        repro_hunger_gate = [55.0, 75.0, 55.0, 55.0, 55.0]
+        repro_thirst_gate = [60.0, 80.0, 60.0, 60.0, 60.0]
         species = self.type[live]
         for sp in range(N_SPECIES):
             p = SPECIES_PARAMS[sp]
@@ -939,8 +963,8 @@ class World:
                 (self.energy[agent_slots] >= p["repro_energy"]) &
                 (self.cooldown[agent_slots] == 0) &
                 (self.age[agent_slots] >= p["min_age"]) &
-                (self.hunger[agent_slots] < 55.0) &
-                (self.thirst[agent_slots] < 60.0)
+                (self.hunger[agent_slots] < repro_hunger_gate[sp]) &
+                (self.thirst[agent_slots] < repro_thirst_gate[sp])
             )
             ready_slots = agent_slots[ready]
             if ready_slots.size == 0:
