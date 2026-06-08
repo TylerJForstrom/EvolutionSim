@@ -66,16 +66,16 @@ SPECIES_PARAMS: list[dict] = [
     # PREDATOR — attack & assimilation tuned down so prey can survive long
     # enough to LEARN to flee; otherwise predator policy converges to "kill
     # everything" before prey policies converge to "avoid predators" and the
-    # whole system collapses (Red-Queen instability). Repro gates loosened
-    # and init pop raised so the predator policy gets enough training samples
-    # per update — at the original numbers it was so data-starved it never
-    # learned, leaving the rest of the species training a fixed-random
-    # opponent (one of the main pathologies of the first run).
+    # whole system collapses (Red-Queen instability). Repro gates further
+    # loosened (energy 180 -> 140, cost 55 -> 40) because the breakdown log
+    # showed predators essentially never reproducing in greedy eval — they
+    # weren't accumulating enough energy on partial-success hunts to clear
+    # the repro_energy gate before something killed them.
     dict(
         speed=0.65, metabolism=0.16, base_energy=86.0, min_age=70, max_age=1300,
-        repro_energy=180.0, repro_cost=55.0, repro_chance=0.022,
+        repro_energy=140.0, repro_cost=40.0, repro_chance=0.022,
         eat_rate=0.0, food_energy=0.0, max_count=80, init_count=14,
-        attack=0.22, handling_min=22, handling_max=40, capture_radius=1.3,
+        attack=0.22, handling_min=22, handling_max=40, capture_radius=1.4,
         assimilation=0.17,
     ),
     # DECOMPOSER
@@ -84,11 +84,14 @@ SPECIES_PARAMS: list[dict] = [
         repro_energy=100.0, repro_cost=38.0, repro_chance=0.018,
         eat_rate=0.06, food_energy=50.0, max_count=220, init_count=30,
     ),
-    # POLLINATOR
+    # POLLINATOR — eat_rate raised because the breakdown showed pollinators
+    # earning only 1.3% of their reward from food; they were dying of
+    # condition penalty (41%) and threat (24%) before they could harvest
+    # enough nectar to reproduce.
     dict(
         speed=0.85, metabolism=0.045, base_energy=45.0, min_age=30, max_age=700,
         repro_energy=70.0, repro_cost=26.0, repro_chance=0.045,
-        eat_rate=0.034, food_energy=55.0, max_count=260, init_count=40,
+        eat_rate=0.048, food_energy=55.0, max_count=260, init_count=40,
     ),
     # ENGINEER
     dict(
@@ -267,7 +270,7 @@ class World:
         )
         # Initial vegetation seeded near capacity so the world isn't sterile.
         vegetation = veg_cap * (0.55 + 0.4 * self.rng.random(veg_cap.shape))
-        flower_cap = np.clip(vegetation * 0.3, 0.0, 0.55)
+        flower_cap = np.clip(vegetation * 0.35, 0.0, 0.7)
         flower = flower_cap * 0.6
 
         self.elevation = elevation.flatten()
@@ -277,7 +280,13 @@ class World:
         self.vegetation = vegetation.flatten()
         self.veg_cap = veg_cap.flatten()
         self.nutrients = nutrients.flatten()
-        self.detritus = 0.04 + 0.06 * self.rng.random(N_CELLS)
+        # Initial detritus pool is sized so decomposers find food in the
+        # early-training phase. Without enough starting detritus they go
+        # straight to chronic starvation (~75% condition penalty observed
+        # in the first breakdown log) and never get a meaningful learning
+        # signal — by the time the system reaches steady state they've
+        # already been culled by rescue migration cycles.
+        self.detritus = 0.10 + 0.14 * self.rng.random(N_CELLS)
         self.flower = flower.flatten()
         self.flower_cap = flower_cap.flatten()
         self.pathogen = np.zeros(N_CELLS)
@@ -402,10 +411,15 @@ class World:
         weathering = 0.00008
         leaching = self.nutrients * self.moisture * 0.0009
         self.nutrients = np.clip(self.nutrients + released + weathering - leaching, 0.0, 1.6)
-        # Nectar regenerates toward a vegetation/season-set target.
+        # Nectar regenerates toward a vegetation/season-set target. Regen
+        # rate bumped 0.08 -> 0.15 and the cap raised so depleted flowers
+        # recover within ~7 ticks instead of ~12. The breakdown log showed
+        # pollinators earning only 1.3% of their reward from food — they
+        # were finding flowers but each visit harvested too little nectar
+        # before depletion, so they couldn't keep up with metabolism.
         flower_season = self.season_flower()
-        self.flower_cap = np.clip(self.vegetation * 0.3 * flower_season * (1 - self.toxicity), 0.0, 0.55)
-        self.flower = np.clip(self.flower + (self.flower_cap - self.flower) * 0.08, 0.0, 0.55)
+        self.flower_cap = np.clip(self.vegetation * 0.35 * flower_season * (1 - self.toxicity), 0.0, 0.7)
+        self.flower = np.clip(self.flower + (self.flower_cap - self.flower) * 0.15, 0.0, 0.7)
         # Pathogen decay.
         self.pathogen *= 0.992
 
@@ -759,7 +773,10 @@ class World:
         take = np.where(graze_mask, take, 0.0)
         np.subtract.at(self.vegetation, cell, take)
         # Egesta returns to detritus (mass conservation).
-        np.add.at(self.detritus, cell, take * 0.22)
+        # Egesta fraction bumped 0.22 -> 0.30 (closer to real ruminant
+        # digestion efficiency) so grazing keeps the detritus pool higher
+        # and decomposers stay fed.
+        np.add.at(self.detritus, cell, take * 0.30)
         food_energy = np.where(is_herb, SPECIES_PARAMS[HERBIVORE]["food_energy"], SPECIES_PARAMS[ENGINEER]["food_energy"])
         gain = take * food_energy * (1.0 - self.toxicity[cell] * 0.4)
         # Add unconditionally (gain is 0 for non-grazers). Per-species cap is
@@ -772,7 +789,11 @@ class World:
 
     def _do_decompose(self, live: np.ndarray, cell: np.ndarray) -> None:
         is_dec = self.type[live] == DECOMPOSER
-        mask = is_dec & (self.detritus[cell] > 0.04)
+        # Lower threshold (0.04 -> 0.015) so decomposers find more cells with
+        # eatable detritus. The starting pool plus egesta-from-grazing keep
+        # this realistic — they're not vacuuming up trace amounts, just
+        # everything above ~3 g/m^2.
+        mask = is_dec & (self.detritus[cell] > 0.015)
         if not mask.any():
             return
         rate = SPECIES_PARAMS[DECOMPOSER]["eat_rate"]
