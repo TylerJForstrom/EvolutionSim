@@ -1,0 +1,8 @@
+# Training dependencies. The numpy backend is the minimum.
+numpy>=1.24
+
+# Optional: PyTorch backend for GPU training. RunPod pods come with torch
+# pre-installed (CUDA build). On a local box with no GPU, install the CPU
+# wheel instead:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.0

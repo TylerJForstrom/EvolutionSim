@@ -125,6 +125,37 @@ setting it ≥ `--eval-episodes` also parallelises greedy eval. Workers stay
 alive across the whole run, so the multiprocessing startup cost (~5 s on
 Windows) amortises after the first update.
 
+### Backends: numpy vs PyTorch (GPU)
+
+There are two interchangeable backends for the per-species actor-critic:
+
+- **numpy (default)** — dependency-free, CPU only, fastest for short runs
+  on a laptop. Manual gradient math, fully readable.
+- **PyTorch** (`--use-torch --device cuda`) — autograd-driven, runs on a
+  GPU when one is available. Mathematically identical to the numpy version.
+  Required for any serious training horizon.
+
+Switching is one flag:
+
+```bash
+# CPU torch (handy for local correctness checks)
+python training/train_multi_agent.py --use-torch --device cpu --updates 50 --batch 2
+
+# GPU torch — typically run on RunPod or similar (see training/RUNPOD.md)
+python training/train_multi_agent.py --use-torch --device cuda --updates 5000 --batch 4 --num-workers 4
+```
+
+Checkpoints are interoperable: the inference-only JSON layout
+(`models_multi/best/*_policy.json`) is the same for both backends, so a
+policy trained on GPU can be loaded and inspected on a numpy-only laptop.
+Resume state (`*_torch.pt` for torch, `*_adam.npz` for numpy) is backend-
+specific and the trainer auto-detects it from `training_state.json` when
+you `--resume`.
+
+For a full GPU walkthrough on RunPod (~$0.50–2/hr) see
+[`training/RUNPOD.md`](RUNPOD.md). Realistic speedup over local numpy on a
+RTX 4090 is ~30–100×.
+
 Outputs after a real run:
 
 - `models_multi/best/{species}_policy.json` — best inference-only checkpoint
