@@ -47,6 +47,16 @@ from multi_agent_env import (  # noqa: E402
 from multi_agent_policy import ActorCritic, TrainConfig  # noqa: E402
 from episode_worker import policy_snapshot, run_episode_remote  # noqa: E402
 
+# Optional torch backend; imported lazily so a numpy-only install still works.
+try:
+    from multi_agent_policy_torch import (  # noqa: E402
+        ActorCriticTorch, cuda_available, torch_available,
+    )
+except ImportError:  # torch missing
+    ActorCriticTorch = None  # type: ignore
+    def torch_available() -> bool: return False
+    def cuda_available() -> bool: return False
+
 
 REWARD_CATEGORIES = ("base", "food", "drink", "repro", "engineer_bonus", "threat", "condition", "death")
 
@@ -257,16 +267,18 @@ def _write_policy_files(out_dir: Path, policies: list[ActorCritic], best_eval: f
 def save_checkpoint(
     root: Path,
     kind: str,
-    policies: list[ActorCritic],
+    policies: list,
     history: list[dict],
     best_eval: float,
     update: int,
     *,
     save_adam: bool,
+    use_torch: bool = False,
 ) -> None:
-    """kind is 'best' or 'last'. Writes per-species policy JSON; for 'last',
-    also writes Adam state per species and a training_state.json so a future
-    --resume can pick up exactly where we left off."""
+    """kind is 'best' or 'last'. Writes per-species policy JSON in a backend-
+    neutral layout (numpy ActorCritic and ActorCriticTorch both emit the
+    same to_dict() shape). For 'last' it also writes the resume artifacts —
+    `_adam.npz` files for numpy or `_torch.pt` files for torch."""
     sub = root / kind
     sub.mkdir(parents=True, exist_ok=True)
     _write_policy_files(sub, policies, best_eval)
@@ -274,35 +286,53 @@ def save_checkpoint(
         "update": int(update),
         "best_eval_score": float(best_eval),
         "kind": kind,
+        "backend": "torch" if use_torch else "numpy",
     }
     (sub / "training_state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
-    # History is the same for best/last — write at root.
     (root / "multi_agent_history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
     if save_adam:
-        for sp in range(N_SPECIES):
-            adam = policies[sp].adam_state()
-            np.savez(sub / f"{SPECIES_NAMES[sp]}_adam.npz", **adam)
+        if use_torch:
+            for sp in range(N_SPECIES):
+                policies[sp].save_torch_state(sub / f"{SPECIES_NAMES[sp]}_torch.pt")
+        else:
+            for sp in range(N_SPECIES):
+                adam = policies[sp].adam_state()
+                np.savez(sub / f"{SPECIES_NAMES[sp]}_adam.npz", **adam)
 
 
 def load_checkpoint(
     root: Path,
     train_cfg: TrainConfig,
-) -> tuple[list[ActorCritic], list[dict], int, float]:
-    """Load policies (with Adam state), history, last update, and best_eval.
-
-    `root` should be a directory written by save_checkpoint with kind='last'.
-    """
+    use_torch: bool = False,
+    device: str = "cpu",
+) -> tuple[list, list[dict], int, float]:
+    """Load policies (with Adam/optimizer state), history, last update, and
+    best_eval. `root` should be a directory written by save_checkpoint with
+    kind='last'. The backend (torch vs numpy) is detected from
+    training_state.json and overrides the caller's flag for consistency."""
     if not (root / "training_state.json").exists():
         raise FileNotFoundError(f"no training_state.json at {root}")
     state = json.loads((root / "training_state.json").read_text(encoding="utf-8"))
-    policies: list[ActorCritic] = []
+    backend = state.get("backend", "numpy")
+    if backend == "torch" and not use_torch:
+        print(f"[load_checkpoint] checkpoint is from torch backend; switching --use-torch on")
+        use_torch = True
+    policies: list = []
     for sp in range(N_SPECIES):
         pdict = json.loads((root / f"{SPECIES_NAMES[sp]}_policy.json").read_text(encoding="utf-8"))
-        p = ActorCritic.from_dict(pdict, seed=sp)
-        adam_path = root / f"{SPECIES_NAMES[sp]}_adam.npz"
-        if adam_path.exists():
-            with np.load(adam_path) as data:
-                p.load_adam_state({k: data[k] for k in data.files})
+        if use_torch:
+            if ActorCriticTorch is None:
+                raise RuntimeError("checkpoint requires torch backend but torch is not installed")
+            p = ActorCriticTorch.from_dict(pdict, seed=sp, device=device)
+            torch_path = root / f"{SPECIES_NAMES[sp]}_torch.pt"
+            if torch_path.exists():
+                p.load_torch_state(torch_path)
+        else:
+            p = ActorCritic.from_dict(pdict, seed=sp)
+            adam_path = root / f"{SPECIES_NAMES[sp]}_adam.npz"
+            if adam_path.exists():
+                with np.load(adam_path) as data:
+                    p.load_adam_state({k: data[k] for k in data.files})
         policies.append(p)
     history_path = root.parent / "multi_agent_history.json"
     history = json.loads(history_path.read_text(encoding="utf-8")) if history_path.exists() else []
@@ -333,7 +363,12 @@ def evaluate(
     breakdown_steps = {sp: 0 for sp in range(N_SPECIES)}
 
     if pool is not None:
-        snapshots = [policy_snapshot(p) for p in policies]
+        # Same logic as the training rollout: numpy snapshot for both backends
+        # (workers don't know about torch).
+        if hasattr(policies[0], "numpy_snapshot"):
+            snapshots = [p.numpy_snapshot() for p in policies]
+        else:
+            snapshots = [policy_snapshot(p) for p in policies]
         batch_args = [
             (snapshots, eval_seed_base + ep * 13, episode_ticks, True, True)
             for ep in range(n_episodes)
@@ -397,6 +432,26 @@ def train(args: argparse.Namespace) -> None:
 
     out_dir = Path(args.out_dir)
 
+    # --- Backend selection -------------------------------------------------
+    use_torch = bool(args.use_torch)
+    device = args.device
+    if use_torch:
+        if not torch_available():
+            raise RuntimeError("--use-torch was set but torch is not installed. Try: pip install torch")
+        if device.startswith("cuda") and not cuda_available():
+            print(f"[backend] CUDA requested but unavailable; falling back to cpu")
+            device = "cpu"
+        print(f"[backend] using torch on device={device}")
+    else:
+        print(f"[backend] using numpy")
+
+    def _make_policy(sp: int):
+        if use_torch:
+            return ActorCriticTorch(OBS_DIM, N_ACTIONS, hidden=train_cfg.hidden,
+                                    seed=rng_seed * 17 + sp, device=device)
+        return ActorCritic(OBS_DIM, N_ACTIONS, hidden=train_cfg.hidden,
+                           seed=rng_seed * 17 + sp)
+
     # --- Resume or fresh start ---
     start_update = 1
     history: list[dict] = []
@@ -404,14 +459,13 @@ def train(args: argparse.Namespace) -> None:
     best_models: dict[int, dict] | None = None
     if args.resume:
         resume_path = Path(args.resume)
-        policies, history, start_update_loaded, best_eval_score = load_checkpoint(resume_path, train_cfg)
+        policies, history, start_update_loaded, best_eval_score = load_checkpoint(
+            resume_path, train_cfg, use_torch=use_torch, device=device,
+        )
         start_update = start_update_loaded + 1
         print(f"resumed from {resume_path} at update {start_update_loaded}, best_eval={best_eval_score:.2f}")
     else:
-        policies = [
-            ActorCritic(OBS_DIM, N_ACTIONS, hidden=train_cfg.hidden, seed=rng_seed * 17 + sp)
-            for sp in range(N_SPECIES)
-        ]
+        policies = [_make_policy(sp) for sp in range(N_SPECIES)]
 
     world = World(seed=rng_seed)
     t_start = time.time()
@@ -442,7 +496,14 @@ def train(args: argparse.Namespace) -> None:
         ep_lifetimes: list[list[int]] = [[] for _ in range(N_SPECIES)]
         episode_seeds = [rng_seed * 31 + update * 7 + ep for ep in range(args.batch)]
         if pool is not None:
-            snapshots = [policy_snapshot(p) for p in policies]
+            # Workers always use the numpy ActorCritic for inference (no torch
+            # dependency in the worker), so torch policies must be snapshotted
+            # via numpy_snapshot() which transposes the weights into the
+            # numpy layout. Numpy policies use the regular policy_snapshot().
+            if use_torch:
+                snapshots = [p.numpy_snapshot() for p in policies]
+            else:
+                snapshots = [policy_snapshot(p) for p in policies]
             batch_args = [
                 (snapshots, seed, args.episode_ticks, False, False)
                 for seed in episode_seeds
@@ -556,12 +617,12 @@ def train(args: argparse.Namespace) -> None:
 
         # --- Periodic checkpointing ---
         if new_best:
-            save_checkpoint(out_dir, "best", policies, history, best_eval_score, update, save_adam=False)
+            save_checkpoint(out_dir, "best", policies, history, best_eval_score, update, save_adam=False, use_torch=use_torch)
         if args.save_every > 0 and (update % args.save_every == 0 or update == args.updates):
-            save_checkpoint(out_dir, "last", policies, history, best_eval_score, update, save_adam=True)
+            save_checkpoint(out_dir, "last", policies, history, best_eval_score, update, save_adam=True, use_torch=use_torch)
 
     # --- Final save ---
-    save_checkpoint(out_dir, "last", policies, history, best_eval_score, args.updates, save_adam=True)
+    save_checkpoint(out_dir, "last", policies, history, best_eval_score, args.updates, save_adam=True, use_torch=use_torch)
     if pool is not None:
         pool.close()
         pool.join()
@@ -597,6 +658,10 @@ def parse_args() -> argparse.Namespace:
                         help="path to a `last/` checkpoint dir to resume from")
     parser.add_argument("--num-workers", type=int, default=0,
                         help="number of multiprocessing workers for parallel episode rollouts (0 = run sequentially in main process). Set to args.batch to fully parallelise rollouts; gives ~3x wall-clock speedup at batch=3.")
+    parser.add_argument("--use-torch", action="store_true",
+                        help="train via the PyTorch backend (autograd, supports GPU). Without this flag the trainer stays on numpy.")
+    parser.add_argument("--device", default="cpu",
+                        help="torch device for --use-torch (e.g. 'cpu', 'cuda', 'cuda:0'). Auto-falls back to cpu if cuda is unavailable.")
     return parser.parse_args()
 
 
