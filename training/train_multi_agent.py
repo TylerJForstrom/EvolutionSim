@@ -662,7 +662,33 @@ def parse_args() -> argparse.Namespace:
                         help="train via the PyTorch backend (autograd, supports GPU). Without this flag the trainer stays on numpy.")
     parser.add_argument("--device", default="cpu",
                         help="torch device for --use-torch (e.g. 'cpu', 'cuda', 'cuda:0'). Auto-falls back to cpu if cuda is unavailable.")
-    return parser.parse_args()
+    parser.add_argument("--profile", choices=("gpu",), default=None,
+                        help="apply a named preset of sensible defaults. 'gpu' = --use-torch, --device cuda (if available), --hidden 128, --batch 4, --num-workers 4. The preset only fills in values left at their CLI defaults; pass explicit flags with non-default values to override individual entries.")
+    args = parser.parse_args()
+    _apply_profile(args)
+    return args
+
+
+def _apply_profile(args: argparse.Namespace) -> None:
+    """Translate a --profile preset into individual flag overrides.
+
+    Each override only fires when the corresponding flag is still at its CLI
+    default, so e.g. `--profile gpu --batch 8` keeps batch=8 while still
+    bumping hidden and num_workers."""
+    if args.profile == "gpu":
+        args.use_torch = True
+        if args.device == "cpu":
+            args.device = "cuda" if cuda_available() else "cpu"
+        if args.hidden == 64:
+            args.hidden = 128
+        if args.batch == 2:
+            args.batch = 4
+        if args.num_workers == 0:
+            args.num_workers = 4
+        print(
+            f"[profile=gpu] use_torch=True device={args.device} hidden={args.hidden} "
+            f"batch={args.batch} num_workers={args.num_workers}"
+        )
 
 
 if __name__ == "__main__":
