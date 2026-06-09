@@ -100,14 +100,50 @@ Real training run (~10–15 min):
 python training/train_multi_agent.py --updates 80 --batch 2 --episode-ticks 600 --log-every 4
 ```
 
-Outputs (best multi-species eval checkpoint):
+Outputs after a real run:
 
-- `models_multi/herbivore_policy.json`
-- `models_multi/predator_policy.json`
-- `models_multi/decomposer_policy.json`
-- `models_multi/pollinator_policy.json`
-- `models_multi/engineer_policy.json`
-- `models_multi/multi_agent_history.json`
+- `models_multi/best/{species}_policy.json` — best inference-only checkpoint
+  for each species, captured whenever the multi-species eval score sets a new
+  high
+- `models_multi/last/{species}_policy.json` + `{species}_adam.npz` — most
+  recent state of each policy plus the Adam moment estimates, used by
+  `--resume` to continue training without restarting from random weights
+- `models_multi/last/training_state.json` — current update count and best
+  eval score (read by `--resume`)
+- `models_multi/multi_agent_history.json` — full eval-score / population /
+  per-species-metric trajectory across the whole run
+
+### Resume / extend training
+
+```bash
+python training/train_multi_agent.py --resume models_multi/last --updates <bigger>
+```
+
+`<bigger>` is the *new total* — e.g. if a run finished at 2280 updates and
+you set `--updates 4000`, the resumed run does another 1720. Adam moments,
+return-normalization stats, and history are all restored.
+
+### Trained policies in this repo
+
+`models_multi/best/` contains the per-species policies from an overnight
+training run (2280 updates, best at update 1056, multi-species
+`eval_score = 243.49` — about 2.4× the strongest score achieved in any
+single-round 200-update tune). The policy files are pure JSON, dependency-
+free to load:
+
+```python
+import json
+weights = json.load(open("models_multi/best/herbivore_policy.json"))
+# weights has keys: W1, b1, W2, b2, Wv, bv  (numpy-style row-major)
+# plus species name, obs_dim, action list, best_eval_score
+```
+
+The training history (`models_multi/multi_agent_history.json`) is a list of
+per-update dicts you can plot with any tool. Useful columns:
+`eval_score`, `best_eval_score`, `eval_avg_pop`, and per-species
+`train_metrics` (entropy, value loss, transitions). The `models_multi/`
+directory is gitignored so the policy files stay local — re-run training
+with `--out-dir <your_dir>` to point elsewhere.
 
 ### What to expect
 
