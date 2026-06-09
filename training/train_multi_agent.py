@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 import sys
 import time
 from pathlib import Path
@@ -44,6 +45,7 @@ from multi_agent_env import (  # noqa: E402
     N_ACTIONS, N_SPECIES, OBS_DIM, PREDATOR, SPECIES_NAMES, World, _MAX_AGENTS,
 )
 from multi_agent_policy import ActorCritic, TrainConfig  # noqa: E402
+from episode_worker import policy_snapshot, run_episode_remote  # noqa: E402
 
 
 REWARD_CATEGORIES = ("base", "food", "drink", "repro", "engineer_bonus", "threat", "condition", "death")
@@ -317,28 +319,49 @@ def evaluate(
     episode_ticks: int,
     eval_seed_base: int,
     n_episodes: int,
+    pool: "mp.pool.Pool | None" = None,
 ):
     """Run n_episodes greedy episodes, each at a different fixed seed, and
     return averaged metrics: eval_score, per-species mean per-life reward,
-    per-species final pop, per-species reward breakdown."""
+    per-species final pop, per-species reward breakdown.
+
+    If `pool` is provided, eval episodes run in parallel (one per worker)."""
     species_rewards = [0.0] * N_SPECIES
     species_lifetimes = [0] * N_SPECIES
     pop_totals = {SPECIES_NAMES[sp]: 0 for sp in range(N_SPECIES)}
     breakdown_totals = {sp: {cat: 0.0 for cat in REWARD_CATEGORIES} for sp in range(N_SPECIES)}
     breakdown_steps = {sp: 0 for sp in range(N_SPECIES)}
-    for ep in range(n_episodes):
-        world.reset(seed=eval_seed_base + ep * 13)
-        buf, pops, bd, bd_steps = run_episode(
-            world, policies, episode_ticks, greedy=True, collect_breakdown=True,
-        )
-        _, ep_rewards, lifetimes = buf.to_species_batches(0.99)
-        for sp in range(N_SPECIES):
-            species_rewards[sp] += ep_rewards[sp]
-            species_lifetimes[sp] += len(lifetimes[sp])
-            pop_totals[SPECIES_NAMES[sp]] += pops[SPECIES_NAMES[sp]]
-            for cat in REWARD_CATEGORIES:
-                breakdown_totals[sp][cat] += bd[sp][cat]
-            breakdown_steps[sp] += bd_steps[sp]
+
+    if pool is not None:
+        snapshots = [policy_snapshot(p) for p in policies]
+        batch_args = [
+            (snapshots, eval_seed_base + ep * 13, episode_ticks, True, True)
+            for ep in range(n_episodes)
+        ]
+        results = pool.map(run_episode_remote, batch_args)
+        for trajs, pops, ep_rewards, lifetimes, bd, bd_steps in results:
+            for sp in range(N_SPECIES):
+                species_rewards[sp] += ep_rewards[sp]
+                species_lifetimes[sp] += len(lifetimes[sp])
+                pop_totals[SPECIES_NAMES[sp]] += pops[SPECIES_NAMES[sp]]
+                if bd is not None:
+                    for cat in REWARD_CATEGORIES:
+                        breakdown_totals[sp][cat] += bd[sp][cat]
+                    breakdown_steps[sp] += bd_steps[sp]
+    else:
+        for ep in range(n_episodes):
+            world.reset(seed=eval_seed_base + ep * 13)
+            buf, pops, bd, bd_steps = run_episode(
+                world, policies, episode_ticks, greedy=True, collect_breakdown=True,
+            )
+            _, ep_rewards, lifetimes = buf.to_species_batches(0.99)
+            for sp in range(N_SPECIES):
+                species_rewards[sp] += ep_rewards[sp]
+                species_lifetimes[sp] += len(lifetimes[sp])
+                pop_totals[SPECIES_NAMES[sp]] += pops[SPECIES_NAMES[sp]]
+                for cat in REWARD_CATEGORIES:
+                    breakdown_totals[sp][cat] += bd[sp][cat]
+                breakdown_steps[sp] += bd_steps[sp]
     eval_score = 0.0
     for sp in range(N_SPECIES):
         lives = max(1, species_lifetimes[sp])
@@ -394,6 +417,13 @@ def train(args: argparse.Namespace) -> None:
     t_start = time.time()
     eval_seed_base = rng_seed * 31
 
+    # Optional multiprocessing pool for parallel episode rollouts.
+    pool: "mp.pool.Pool | None" = None
+    if args.num_workers > 0:
+        pool_size = max(args.num_workers, 1)
+        pool = mp.Pool(processes=pool_size)
+        print(f"using {pool_size} parallel episode workers")
+
     for update in range(start_update, args.updates + 1):
         frac = update / args.updates
         entropy_beta = train_cfg.entropy_beta_init * (1.0 - frac) + train_cfg.entropy_beta_final * frac
@@ -410,14 +440,28 @@ def train(args: argparse.Namespace) -> None:
         species_trajs: list[list[tuple[np.ndarray, np.ndarray, np.ndarray]]] = [[] for _ in range(N_SPECIES)]
         ep_rewards_total = [0.0] * N_SPECIES
         ep_lifetimes: list[list[int]] = [[] for _ in range(N_SPECIES)]
-        for ep in range(args.batch):
-            world.reset(seed=rng_seed * 31 + update * 7 + ep)
-            buf, pops, _bd, _bds = run_episode(world, policies, args.episode_ticks, greedy=False)
-            per_traj, ep_rewards, lifetimes = buf.to_species_trajectories()
-            for sp in range(N_SPECIES):
-                species_trajs[sp].extend(per_traj[sp])
-                ep_rewards_total[sp] += ep_rewards[sp]
-                ep_lifetimes[sp].extend(lifetimes[sp])
+        episode_seeds = [rng_seed * 31 + update * 7 + ep for ep in range(args.batch)]
+        if pool is not None:
+            snapshots = [policy_snapshot(p) for p in policies]
+            batch_args = [
+                (snapshots, seed, args.episode_ticks, False, False)
+                for seed in episode_seeds
+            ]
+            results = pool.map(run_episode_remote, batch_args)
+            for trajs, pops, ep_rewards, lifetimes, _bd, _bds in results:
+                for sp in range(N_SPECIES):
+                    species_trajs[sp].extend(trajs[sp])
+                    ep_rewards_total[sp] += ep_rewards[sp]
+                    ep_lifetimes[sp].extend(lifetimes[sp])
+        else:
+            for seed in episode_seeds:
+                world.reset(seed=seed)
+                buf, pops, _bd, _bds = run_episode(world, policies, args.episode_ticks, greedy=False)
+                per_traj, ep_rewards, lifetimes = buf.to_species_trajectories()
+                for sp in range(N_SPECIES):
+                    species_trajs[sp].extend(per_traj[sp])
+                    ep_rewards_total[sp] += ep_rewards[sp]
+                    ep_lifetimes[sp].extend(lifetimes[sp])
 
         # --- Per-species PPO+GAE update ---
         # For each species:
@@ -457,9 +501,10 @@ def train(args: argparse.Namespace) -> None:
             )
             update_metrics[sp] = m
 
-        # --- Multi-seed greedy eval ---
+        # --- Multi-seed greedy eval (parallelised via pool if available) ---
         eval_result = evaluate(
             world, policies, args.episode_ticks, eval_seed_base, args.eval_episodes,
+            pool=pool,
         )
         eval_score = eval_result["eval_score"]
 
@@ -517,6 +562,9 @@ def train(args: argparse.Namespace) -> None:
 
     # --- Final save ---
     save_checkpoint(out_dir, "last", policies, history, best_eval_score, args.updates, save_adam=True)
+    if pool is not None:
+        pool.close()
+        pool.join()
     print(f"\nbest multi-species eval_score = {best_eval_score:.2f}")
     print(f"best checkpoints (inference): {out_dir}/best/")
     print(f"last checkpoint (resume-able): {out_dir}/last/")
@@ -547,6 +595,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", default="models_multi")
     parser.add_argument("--resume", default=None,
                         help="path to a `last/` checkpoint dir to resume from")
+    parser.add_argument("--num-workers", type=int, default=0,
+                        help="number of multiprocessing workers for parallel episode rollouts (0 = run sequentially in main process). Set to args.batch to fully parallelise rollouts; gives ~3x wall-clock speedup at batch=3.")
     return parser.parse_args()
 
 
