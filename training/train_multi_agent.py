@@ -529,7 +529,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--updates", type=int, default=60)
     parser.add_argument("--batch", type=int, default=2, help="episodes per gradient update")
     parser.add_argument("--episode-ticks", type=int, default=600)
-    parser.add_argument("--hidden", type=int, default=64)
+    parser.add_argument("--hidden", type=int, default=64, help="hidden layer width per species (only used on fresh starts; resumes read it from the checkpoint). 128 gives slightly better quality at ~4x wall-clock; 64 is the sweet spot for pure-numpy on CPU.")
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--lr", type=float, default=0.005)
     parser.add_argument("--clip", type=float, default=5.0)
