@@ -26,11 +26,15 @@ import numpy as np
 class TrainConfig:
     lr: float = 0.005
     gamma: float = 0.99
+    gae_lambda: float = 0.95
     entropy_beta_init: float = 0.015
     entropy_beta_final: float = 0.001
     value_coef: float = 0.5
     grad_clip: float = 5.0
     hidden: int = 64
+    # PPO knobs.
+    ppo_epochs: int = 4
+    ppo_clip: float = 0.2
 
 
 class ActorCritic:
@@ -209,6 +213,135 @@ class ActorCritic:
         entropy_mean = float(H_row.mean())
         value_loss = float(0.5 * (v_err * v_err).mean())
         return {"entropy": entropy_mean, "value_loss": value_loss, "n": int(N)}
+
+    # --------------------------- PPO update --------------------------------
+    def log_probs_and_values(self, obs: np.ndarray, actions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Helper used by the trainer to capture old log-probs and values
+        before the PPO epochs (so the multi-epoch ratio is meaningful)."""
+        if obs.shape[0] == 0:
+            return np.zeros(0), np.zeros(0)
+        _hidden, probs, values = self.forward(obs)
+        N = obs.shape[0]
+        log_probs = np.log(probs[np.arange(N), actions] + 1e-12)
+        return log_probs, values
+
+    def update_ppo(
+        self,
+        obs: np.ndarray,            # (N, obs_size)
+        actions: np.ndarray,        # (N,) int
+        old_log_probs: np.ndarray,  # (N,) log π_old(a|s)
+        advantages: np.ndarray,     # (N,) raw advantages (will be normalized once)
+        returns_target: np.ndarray, # (N,) value-head target (e.g. GAE + V)
+        cfg: TrainConfig,
+        entropy_beta: float,
+    ) -> dict:
+        """PPO-clip update: K epochs over the same batch with clipped surrogate
+        loss. Mathematically:
+            L_clip = E[ min(ratio * A, clip(ratio, 1-eps, 1+eps) * A) ]
+        where ratio = exp(log π_new(a|s) - log π_old(a|s)). Compared with the
+        single-step `update`, PPO reuses each transition several times without
+        the policy walking off into the distribution it can't recover from.
+
+        Returns diagnostic dict: entropy, value_loss, kl (approx), clip_frac.
+        """
+        if obs.shape[0] == 0:
+            return {"entropy": 0.0, "value_loss": 0.0, "n": 0, "kl": 0.0, "clip_frac": 0.0}
+
+        N = obs.shape[0]
+        # Value-target normalization (running mean/var) keeps the value-head
+        # gradient on the same scale as the policy gradient regardless of how
+        # big raw returns happen to be.
+        self.update_ret_stats(returns_target)
+        rmean = self.ret_mean
+        rstd = self.ret_std()
+        rn = (returns_target - rmean) / rstd
+
+        # Advantage normalization, ONCE before the PPO epochs (standard).
+        adv = advantages
+        if adv.size > 1:
+            adv = (adv - adv.mean()) / (adv.std() + 1e-6)
+
+        last = {"entropy": 0.0, "value_loss": 0.0, "kl": 0.0, "clip_frac": 0.0}
+
+        b1, b2, eps = 0.9, 0.999, 1e-8
+
+        for _epoch in range(cfg.ppo_epochs):
+            hidden, probs, value = self.forward(obs)
+
+            new_log_probs = np.log(probs[np.arange(N), actions] + 1e-12)
+            ratios = np.exp(new_log_probs - old_log_probs)
+
+            # Clip mask. When the clip is active in the direction that would
+            # make the loss WORSE we propagate gradient 0 (the clipped term
+            # is constant w.r.t. policy params); otherwise we propagate the
+            # ratio * advantage term as usual.
+            clipped_high = (adv > 0) & (ratios > 1.0 + cfg.ppo_clip)
+            clipped_low = (adv < 0) & (ratios < 1.0 - cfg.ppo_clip)
+            clipped = clipped_high | clipped_low
+            coef = np.where(clipped, 0.0, ratios * adv)
+
+            # Policy gradient on logits: coef * (1{a=action} - p_a)
+            onehot = np.zeros_like(probs)
+            onehot[np.arange(N), actions] = 1.0
+            g_logits = coef[:, None] * (onehot - probs)
+
+            # Entropy bonus on logits (same as in update()).
+            log_p_full = np.log(probs + 1e-12)
+            H_row = -(probs * log_p_full).sum(axis=1, keepdims=True)
+            ent_grad = -probs * (log_p_full + H_row)
+            g_logits = g_logits + entropy_beta * ent_grad
+
+            # Output layer (policy head) grads.
+            gW2 = hidden.T @ g_logits / N
+            gb2 = g_logits.mean(axis=0)
+            dh = g_logits @ self.W2.T
+
+            # Value head.
+            v_err = value - rn
+            gWv = -cfg.value_coef * (v_err[:, None] * hidden).mean(axis=0)
+            gbv = -cfg.value_coef * v_err.mean()
+            dh += -cfg.value_coef * v_err[:, None] * self.Wv[None, :]
+
+            # First layer through tanh.
+            dz1 = dh * (1.0 - hidden * hidden)
+            gW1 = obs.T @ dz1 / N
+            gb1 = dz1.mean(axis=0)
+
+            # Global grad-norm clip.
+            grads = [gW1, gb1, gW2, gb2, gWv, np.array([gbv])]
+            norm = math.sqrt(sum(float((g * g).sum()) for g in grads))
+            clip_factor = min(1.0, cfg.grad_clip / (norm + 1e-12)) if cfg.grad_clip > 0 else 1.0
+            gW1 *= clip_factor; gb1 *= clip_factor; gW2 *= clip_factor
+            gb2 *= clip_factor; gWv *= clip_factor; gbv *= clip_factor
+
+            # Adam.
+            self.adam_t += 1
+            bc1 = 1.0 - b1 ** self.adam_t
+            bc2 = 1.0 - b2 ** self.adam_t
+
+            def _adam(p, m, v, g):
+                m[...] = b1 * m + (1.0 - b1) * g
+                v[...] = b2 * v + (1.0 - b2) * g * g
+                p[...] += cfg.lr * (m / bc1) / (np.sqrt(v / bc2) + eps)
+
+            _adam(self.W1, self.mW1, self.vW1, gW1)
+            _adam(self.b1, self.mb1, self.vb1, gb1)
+            _adam(self.W2, self.mW2, self.vW2, gW2)
+            _adam(self.b2, self.mb2, self.vb2, gb2)
+            _adam(self.Wv, self.mWv, self.vWv, gWv)
+            self.mbv = b1 * self.mbv + (1.0 - b1) * gbv
+            self.vbv = b2 * self.vbv + (1.0 - b2) * gbv * gbv
+            self.bv += cfg.lr * (self.mbv / bc1) / (math.sqrt(self.vbv / bc2) + eps)
+
+            last["entropy"] = float(H_row.mean())
+            last["value_loss"] = float(0.5 * (v_err * v_err).mean())
+            # Approx KL: E[log π_old - log π_new]. Negative means new policy
+            # is more confident on these actions.
+            last["kl"] = float((old_log_probs - new_log_probs).mean())
+            last["clip_frac"] = float(clipped.mean())
+
+        last["n"] = int(N)
+        return last
 
     # -------------------------- serialization -------------------------------
     def to_dict(self) -> dict:

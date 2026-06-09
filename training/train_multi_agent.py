@@ -84,11 +84,12 @@ class TrajBuffer:
         self.acts[slot].append(int(action))
         self.rews[slot].append(float(reward))
 
-    def to_species_batches(self, gamma: float):
-        """Return dict[species_idx] -> (obs, actions, returns) as numpy arrays."""
-        per_obs = [[] for _ in range(N_SPECIES)]
-        per_acts = [[] for _ in range(N_SPECIES)]
-        per_returns = [[] for _ in range(N_SPECIES)]
+    def to_species_trajectories(self):
+        """Return per-species lists of (obs, actions, rewards) numpy arrays,
+        one entry per agent lifetime. The trainer uses these to compute GAE
+        advantages against policy values, which needs the per-trajectory
+        structure (returns are not enough)."""
+        per_traj: list[list[tuple[np.ndarray, np.ndarray, np.ndarray]]] = [[] for _ in range(N_SPECIES)]
         per_episode_rewards = [0.0] * N_SPECIES
         per_lifetimes: list[list[int]] = [[] for _ in range(N_SPECIES)]
         for slot in range(_MAX_AGENTS):
@@ -98,23 +99,37 @@ class TrajBuffer:
             rews = self.rews[slot]
             if not rews:
                 continue
-            G = 0.0
-            returns = [0.0] * len(rews)
-            for i in range(len(rews) - 1, -1, -1):
-                G = rews[i] + gamma * G
-                returns[i] = G
-            per_obs[sp].extend(self.obs[slot])
-            per_acts[sp].extend(self.acts[slot])
-            per_returns[sp].extend(returns)
-            per_episode_rewards[sp] += sum(rews)
+            obs_arr = np.array(self.obs[slot])
+            act_arr = np.array(self.acts[slot], dtype=np.int64)
+            rew_arr = np.array(rews)
+            per_traj[sp].append((obs_arr, act_arr, rew_arr))
+            per_episode_rewards[sp] += float(rew_arr.sum())
             per_lifetimes[sp].append(len(rews))
+        return per_traj, per_episode_rewards, per_lifetimes
+
+    # Kept for older eval code paths that just want raw returns.
+    def to_species_batches(self, gamma: float):
+        per_traj, per_rew, per_lives = self.to_species_trajectories()
         out = {}
         for sp in range(N_SPECIES):
-            if per_obs[sp]:
+            obs_chunks: list[np.ndarray] = []
+            act_chunks: list[np.ndarray] = []
+            ret_chunks: list[np.ndarray] = []
+            for obs_arr, act_arr, rew_arr in per_traj[sp]:
+                # Monte Carlo return-to-go (no bootstrap).
+                G = 0.0
+                returns = np.zeros_like(rew_arr)
+                for i in range(rew_arr.size - 1, -1, -1):
+                    G = float(rew_arr[i]) + gamma * G
+                    returns[i] = G
+                obs_chunks.append(obs_arr)
+                act_chunks.append(act_arr)
+                ret_chunks.append(returns)
+            if obs_chunks:
                 out[sp] = (
-                    np.array(per_obs[sp]),
-                    np.array(per_acts[sp], dtype=np.int64),
-                    np.array(per_returns[sp]),
+                    np.concatenate(obs_chunks, axis=0),
+                    np.concatenate(act_chunks, axis=0),
+                    np.concatenate(ret_chunks, axis=0),
                 )
             else:
                 out[sp] = (
@@ -122,7 +137,37 @@ class TrajBuffer:
                     np.zeros(0, dtype=np.int64),
                     np.zeros(0),
                 )
-        return out, per_episode_rewards, per_lifetimes
+        return out, per_rew, per_lives
+
+
+# ---------------------------------------------------------------------------
+# GAE computation
+# ---------------------------------------------------------------------------
+
+def compute_gae(rewards: np.ndarray, values: np.ndarray, gamma: float, lam: float) -> tuple[np.ndarray, np.ndarray]:
+    """GAE-λ advantages for a single trajectory.
+
+    Returns (advantages, returns_target) where:
+        δ_t          = r_t + γ V(s_{t+1}) - V(s_t)   (with V(s_T) = 0)
+        A_t          = δ_t + γλ A_{t+1}
+        R_target_t   = A_t + V(s_t)                  (target for value head)
+
+    We treat trajectory end (death OR episode truncation) as terminal (next
+    value = 0). This adds a small bias for truncated trajectories of healthy
+    agents but keeps the implementation simple.
+    """
+    T = rewards.size
+    if T == 0:
+        return np.zeros(0), np.zeros(0)
+    advantages = np.zeros(T)
+    gae = 0.0
+    for t in range(T - 1, -1, -1):
+        next_value = values[t + 1] if t + 1 < T else 0.0
+        delta = float(rewards[t]) + gamma * next_value - float(values[t])
+        gae = delta + gamma * lam * gae
+        advantages[t] = gae
+    returns_target = advantages + values
+    return advantages, returns_target
 
 
 # ---------------------------------------------------------------------------
@@ -361,36 +406,55 @@ def train(args: argparse.Namespace) -> None:
             + train_cfg.entropy_beta_final * pred_frac
         )
 
-        # --- Collect rollouts ---
-        species_obs: list[list[np.ndarray]] = [[] for _ in range(N_SPECIES)]
-        species_acts: list[list[np.ndarray]] = [[] for _ in range(N_SPECIES)]
-        species_rets: list[list[np.ndarray]] = [[] for _ in range(N_SPECIES)]
+        # --- Collect rollouts: keep per-trajectory structure for GAE ---
+        species_trajs: list[list[tuple[np.ndarray, np.ndarray, np.ndarray]]] = [[] for _ in range(N_SPECIES)]
         ep_rewards_total = [0.0] * N_SPECIES
         ep_lifetimes: list[list[int]] = [[] for _ in range(N_SPECIES)]
         for ep in range(args.batch):
             world.reset(seed=rng_seed * 31 + update * 7 + ep)
             buf, pops, _bd, _bds = run_episode(world, policies, args.episode_ticks, greedy=False)
-            batches, ep_rewards, lifetimes = buf.to_species_batches(train_cfg.gamma)
+            per_traj, ep_rewards, lifetimes = buf.to_species_trajectories()
             for sp in range(N_SPECIES):
-                o, a, r = batches[sp]
-                if o.shape[0] > 0:
-                    species_obs[sp].append(o)
-                    species_acts[sp].append(a)
-                    species_rets[sp].append(r)
+                species_trajs[sp].extend(per_traj[sp])
                 ep_rewards_total[sp] += ep_rewards[sp]
                 ep_lifetimes[sp].extend(lifetimes[sp])
 
-        # --- Per-species update ---
+        # --- Per-species PPO+GAE update ---
+        # For each species:
+        # 1. flatten all trajectories into one batch (obs, acts, rewards)
+        # 2. forward through current policy to get old log-probs and values
+        # 3. compute GAE per trajectory using those values
+        # 4. concatenate advantages and returns_target across trajectories
+        # 5. run K PPO epochs over the flat batch
         update_metrics = {}
         for sp in range(N_SPECIES):
-            if not species_obs[sp]:
-                update_metrics[sp] = {"entropy": 0.0, "value_loss": 0.0, "n": 0}
+            trajs = species_trajs[sp]
+            if not trajs:
+                update_metrics[sp] = {"entropy": 0.0, "value_loss": 0.0, "n": 0, "kl": 0.0, "clip_frac": 0.0}
                 continue
-            obs = np.concatenate(species_obs[sp], axis=0)
-            acts = np.concatenate(species_acts[sp], axis=0)
-            rets = np.concatenate(species_rets[sp], axis=0)
+            obs = np.concatenate([t[0] for t in trajs], axis=0)
+            acts = np.concatenate([t[1] for t in trajs], axis=0)
+
+            old_log_probs, values = policies[sp].log_probs_and_values(obs, acts)
+
+            # GAE per trajectory, then concatenate.
+            advantages_chunks: list[np.ndarray] = []
+            returns_chunks: list[np.ndarray] = []
+            cursor = 0
+            for _obs_arr, _act_arr, rew_arr in trajs:
+                T = rew_arr.size
+                traj_values = values[cursor:cursor + T]
+                adv, ret_t = compute_gae(rew_arr, traj_values, train_cfg.gamma, train_cfg.gae_lambda)
+                advantages_chunks.append(adv)
+                returns_chunks.append(ret_t)
+                cursor += T
+            advantages = np.concatenate(advantages_chunks)
+            returns_target = np.concatenate(returns_chunks)
+
             beta = pred_entropy_beta if sp == PREDATOR else entropy_beta
-            m = policies[sp].update(obs, acts, rets, train_cfg, beta)
+            m = policies[sp].update_ppo(
+                obs, acts, old_log_probs, advantages, returns_target, train_cfg, beta,
+            )
             update_metrics[sp] = m
 
         # --- Multi-seed greedy eval ---
@@ -420,9 +484,11 @@ def train(args: argparse.Namespace) -> None:
                 m = update_metrics[sp]
                 train_r = ep_rewards_total[sp] / max(1, len(ep_lifetimes[sp])) if ep_lifetimes[sp] else 0.0
                 eval_r = eval_result["species_rewards_per_life"][sp]
+                kl = m.get("kl", 0.0)
+                clip_frac = m.get("clip_frac", 0.0)
                 print(
                     f"    {SPECIES_NAMES[sp][:4]:>4}: train_r={train_r:6.2f} eval_r={eval_r:6.2f} life={avg_life:5.1f} "
-                    f"H={m['entropy']:.2f} vL={m['value_loss']:.2f} n={m['n']}"
+                    f"H={m['entropy']:.2f} vL={m['value_loss']:.2f} KL={kl:+.3f} clip={clip_frac*100:4.1f}% n={m['n']}"
                 )
         if log_breakdown:
             print("    -- reward breakdown (% of total positive + negative reward per species, from eval) --")
