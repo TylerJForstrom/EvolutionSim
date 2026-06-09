@@ -234,6 +234,10 @@ class ActorCritic:
         returns_target: np.ndarray, # (N,) value-head target (e.g. GAE + V)
         cfg: TrainConfig,
         entropy_beta: float,
+        *,
+        lr_override: float | None = None,
+        ppo_clip_override: float | None = None,
+        target_kl: float | None = None,
     ) -> dict:
         """PPO-clip update: K epochs over the same batch with clipped surrogate
         loss. Mathematically:
@@ -242,10 +246,22 @@ class ActorCritic:
         single-step `update`, PPO reuses each transition several times without
         the policy walking off into the distribution it can't recover from.
 
-        Returns diagnostic dict: entropy, value_loss, kl (approx), clip_frac.
+        Per-species overrides: `lr_override` and `ppo_clip_override` let the
+        trainer apply species-specific hyperparameters without mutating the
+        shared TrainConfig. `target_kl` enables early-stopping the PPO epoch
+        loop when the approximate KL between the current policy and the
+        snapshot policy exceeds 1.5x this value — a standard PPO refinement
+        that prevents over-large updates from getting through when a few
+        epochs happen to push hard.
+
+        Returns diagnostic dict: entropy, value_loss, kl (approx), clip_frac,
+        ppo_epochs_run (so the trainer can log early-stop activations).
         """
         if obs.shape[0] == 0:
-            return {"entropy": 0.0, "value_loss": 0.0, "n": 0, "kl": 0.0, "clip_frac": 0.0}
+            return {"entropy": 0.0, "value_loss": 0.0, "n": 0, "kl": 0.0, "clip_frac": 0.0, "ppo_epochs_run": 0}
+
+        lr = cfg.lr if lr_override is None else lr_override
+        clip_eps = cfg.ppo_clip if ppo_clip_override is None else ppo_clip_override
 
         N = obs.shape[0]
         # Value-target normalization (running mean/var) keeps the value-head
@@ -261,22 +277,30 @@ class ActorCritic:
         if adv.size > 1:
             adv = (adv - adv.mean()) / (adv.std() + 1e-6)
 
-        last = {"entropy": 0.0, "value_loss": 0.0, "kl": 0.0, "clip_frac": 0.0}
+        last = {"entropy": 0.0, "value_loss": 0.0, "kl": 0.0, "clip_frac": 0.0, "ppo_epochs_run": 0}
 
         b1, b2, eps = 0.9, 0.999, 1e-8
 
-        for _epoch in range(cfg.ppo_epochs):
+        for epoch_idx in range(cfg.ppo_epochs):
             hidden, probs, value = self.forward(obs)
 
             new_log_probs = np.log(probs[np.arange(N), actions] + 1e-12)
             ratios = np.exp(new_log_probs - old_log_probs)
 
+            # Approximate KL between snapshot and current — used both as a
+            # diagnostic and (when target_kl is set) for early stopping.
+            approx_kl = float((old_log_probs - new_log_probs).mean())
+            if target_kl is not None and approx_kl > 1.5 * target_kl:
+                # KL has drifted too far this update; skip remaining epochs.
+                last["ppo_epochs_run"] = epoch_idx
+                break
+
             # Clip mask. When the clip is active in the direction that would
             # make the loss WORSE we propagate gradient 0 (the clipped term
             # is constant w.r.t. policy params); otherwise we propagate the
             # ratio * advantage term as usual.
-            clipped_high = (adv > 0) & (ratios > 1.0 + cfg.ppo_clip)
-            clipped_low = (adv < 0) & (ratios < 1.0 - cfg.ppo_clip)
+            clipped_high = (adv > 0) & (ratios > 1.0 + clip_eps)
+            clipped_low = (adv < 0) & (ratios < 1.0 - clip_eps)
             clipped = clipped_high | clipped_low
             coef = np.where(clipped, 0.0, ratios * adv)
 
@@ -322,7 +346,7 @@ class ActorCritic:
             def _adam(p, m, v, g):
                 m[...] = b1 * m + (1.0 - b1) * g
                 v[...] = b2 * v + (1.0 - b2) * g * g
-                p[...] += cfg.lr * (m / bc1) / (np.sqrt(v / bc2) + eps)
+                p[...] += lr * (m / bc1) / (np.sqrt(v / bc2) + eps)
 
             _adam(self.W1, self.mW1, self.vW1, gW1)
             _adam(self.b1, self.mb1, self.vb1, gb1)
@@ -331,14 +355,13 @@ class ActorCritic:
             _adam(self.Wv, self.mWv, self.vWv, gWv)
             self.mbv = b1 * self.mbv + (1.0 - b1) * gbv
             self.vbv = b2 * self.vbv + (1.0 - b2) * gbv * gbv
-            self.bv += cfg.lr * (self.mbv / bc1) / (math.sqrt(self.vbv / bc2) + eps)
+            self.bv += lr * (self.mbv / bc1) / (math.sqrt(self.vbv / bc2) + eps)
 
             last["entropy"] = float(H_row.mean())
             last["value_loss"] = float(0.5 * (v_err * v_err).mean())
-            # Approx KL: E[log π_old - log π_new]. Negative means new policy
-            # is more confident on these actions.
-            last["kl"] = float((old_log_probs - new_log_probs).mean())
+            last["kl"] = approx_kl
             last["clip_frac"] = float(clipped.mean())
+            last["ppo_epochs_run"] = epoch_idx + 1
 
         last["n"] = int(N)
         return last

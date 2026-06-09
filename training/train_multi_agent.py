@@ -42,7 +42,8 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from multi_agent_env import (  # noqa: E402
-    N_ACTIONS, N_SPECIES, OBS_DIM, PREDATOR, SPECIES_NAMES, World, _MAX_AGENTS,
+    DECOMPOSER, ENGINEER, HERBIVORE, N_ACTIONS, N_SPECIES, OBS_DIM,
+    POLLINATOR, PREDATOR, SPECIES_NAMES, World, _MAX_AGENTS,
 )
 from multi_agent_policy import ActorCritic, TrainConfig  # noqa: E402
 from episode_worker import policy_snapshot, run_episode_remote  # noqa: E402
@@ -59,6 +60,26 @@ except ImportError:  # torch missing
 
 
 REWARD_CATEGORIES = ("base", "food", "drink", "repro", "engineer_bonus", "threat", "condition", "death")
+
+
+# Per-species PPO/optimizer overrides. These are diagnostic-driven adjustments
+# from the first GPU run (440 updates, eval=217.7), where:
+#   - herbivore had KL=+0.19 and clip_frac=33% (PPO updates thrashing — over-
+#     large steps that kept getting clipped). Lower lr + tighter ppo_clip
+#     stabilises it.
+#   - pollinator collapsed to entropy=0.05 (mode collapse — near-deterministic
+#     policy stuck on one trick). Higher entropy floor keeps exploration.
+#   - predator/decomposer/engineer were stable, no override needed.
+SPECIES_TUNING: dict[int, dict] = {
+    HERBIVORE: {"lr": 0.002, "ppo_clip": 0.1, "entropy_floor": 0.005},
+    PREDATOR:  {"entropy_decay_frac": 0.4},          # slow decay, same as before
+    DECOMPOSER: {},
+    POLLINATOR: {"entropy_floor": 0.01},             # explicit anti-collapse
+    ENGINEER:  {},
+}
+# Per-species target KL for PPO early stopping. Defaults to 0.02 (~half of
+# the OpenAI PPO recommended target_kl=0.04) which is conservative.
+DEFAULT_TARGET_KL = 0.02
 
 
 # ---------------------------------------------------------------------------
@@ -480,15 +501,10 @@ def train(args: argparse.Namespace) -> None:
 
     for update in range(start_update, args.updates + 1):
         frac = update / args.updates
+        # The default linear-decay schedule (used by species not in
+        # SPECIES_TUNING and as the reference for those that customise it).
+        # Per-species entropy schedules are computed below in the update loop.
         entropy_beta = train_cfg.entropy_beta_init * (1.0 - frac) + train_cfg.entropy_beta_final * frac
-        # Predator gets a slower entropy decay because its training task is
-        # the hardest and its population is smallest. Without this it stays
-        # near-uniform and never escapes random.
-        pred_frac = frac * 0.4
-        pred_entropy_beta = (
-            train_cfg.entropy_beta_init * (1.0 - pred_frac)
-            + train_cfg.entropy_beta_final * pred_frac
-        )
 
         # --- Collect rollouts: keep per-trajectory structure for GAE ---
         species_trajs: list[list[tuple[np.ndarray, np.ndarray, np.ndarray]]] = [[] for _ in range(N_SPECIES)]
@@ -530,19 +546,20 @@ def train(args: argparse.Namespace) -> None:
         # 2. forward through current policy to get old log-probs and values
         # 3. compute GAE per trajectory using those values
         # 4. concatenate advantages and returns_target across trajectories
-        # 5. run K PPO epochs over the flat batch
+        # 5. run K PPO epochs over the flat batch (with KL early stop)
+        # SPECIES_TUNING applies per-species lr / ppo_clip / entropy_floor /
+        # entropy_decay_frac overrides defined at module scope.
         update_metrics = {}
         for sp in range(N_SPECIES):
             trajs = species_trajs[sp]
             if not trajs:
-                update_metrics[sp] = {"entropy": 0.0, "value_loss": 0.0, "n": 0, "kl": 0.0, "clip_frac": 0.0}
+                update_metrics[sp] = {"entropy": 0.0, "value_loss": 0.0, "n": 0, "kl": 0.0, "clip_frac": 0.0, "ppo_epochs_run": 0}
                 continue
             obs = np.concatenate([t[0] for t in trajs], axis=0)
             acts = np.concatenate([t[1] for t in trajs], axis=0)
 
             old_log_probs, values = policies[sp].log_probs_and_values(obs, acts)
 
-            # GAE per trajectory, then concatenate.
             advantages_chunks: list[np.ndarray] = []
             returns_chunks: list[np.ndarray] = []
             cursor = 0
@@ -556,9 +573,27 @@ def train(args: argparse.Namespace) -> None:
             advantages = np.concatenate(advantages_chunks)
             returns_target = np.concatenate(returns_chunks)
 
-            beta = pred_entropy_beta if sp == PREDATOR else entropy_beta
+            # Per-species hyperparameter overrides.
+            tune = SPECIES_TUNING.get(sp, {})
+
+            # Per-species entropy schedule. Default is the global linear
+            # decay; predator gets a slower decay (entropy_decay_frac=0.4)
+            # because its task is hardest. Each species can also set an
+            # entropy_floor to clamp the result above a minimum (anti-
+            # collapse for pollinator/herbivore).
+            decay_frac = tune.get("entropy_decay_frac", 1.0)
+            sp_frac = frac * decay_frac
+            sp_beta = (
+                train_cfg.entropy_beta_init * (1.0 - sp_frac)
+                + train_cfg.entropy_beta_final * sp_frac
+            )
+            sp_beta = max(sp_beta, tune.get("entropy_floor", 0.0))
+
             m = policies[sp].update_ppo(
-                obs, acts, old_log_probs, advantages, returns_target, train_cfg, beta,
+                obs, acts, old_log_probs, advantages, returns_target, train_cfg, sp_beta,
+                lr_override=tune.get("lr"),
+                ppo_clip_override=tune.get("ppo_clip"),
+                target_kl=args.target_kl if args.target_kl > 0 else None,
             )
             update_metrics[sp] = m
 
@@ -592,9 +627,10 @@ def train(args: argparse.Namespace) -> None:
                 eval_r = eval_result["species_rewards_per_life"][sp]
                 kl = m.get("kl", 0.0)
                 clip_frac = m.get("clip_frac", 0.0)
+                eps = m.get("ppo_epochs_run", train_cfg.ppo_epochs)
                 print(
                     f"    {SPECIES_NAMES[sp][:4]:>4}: train_r={train_r:6.2f} eval_r={eval_r:6.2f} life={avg_life:5.1f} "
-                    f"H={m['entropy']:.2f} vL={m['value_loss']:.2f} KL={kl:+.3f} clip={clip_frac*100:4.1f}% n={m['n']}"
+                    f"H={m['entropy']:.2f} vL={m['value_loss']:.2f} KL={kl:+.3f} clip={clip_frac*100:4.1f}% ep={eps} n={m['n']}"
                 )
         if log_breakdown:
             print("    -- reward breakdown (% of total positive + negative reward per species, from eval) --")
@@ -643,14 +679,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=0.005)
     parser.add_argument("--clip", type=float, default=5.0)
     parser.add_argument("--entropy-beta", type=float, default=0.015)
-    parser.add_argument("--entropy-final", type=float, default=0.001)
+    parser.add_argument("--entropy-final", type=float, default=0.005,
+                        help="entropy bonus at end of schedule. Bumped from 0.001 -> 0.005 because the first GPU run showed mode collapse on pollinator (entropy 0.05). Per-species floors in SPECIES_TUNING can raise this further.")
     parser.add_argument("--value-coef", type=float, default=0.5)
+    parser.add_argument("--target-kl", type=float, default=0.02,
+                        help="PPO early stop threshold; the per-species update loop breaks when approx KL > 1.5*target_kl. Set 0 to disable.")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--log-every", type=int, default=2)
     parser.add_argument("--log-breakdown-every", type=int, default=10,
                         help="log per-species reward breakdown every N updates (0 to disable)")
-    parser.add_argument("--eval-episodes", type=int, default=3,
-                        help="number of greedy eval episodes per update")
+    parser.add_argument("--eval-episodes", type=int, default=6,
+                        help="number of greedy eval episodes per update. Bumped from 3 -> 6 because at 3 episodes the eval_score variance was ±50 across updates which made best_eval tracking noisy. 6 cuts that variance roughly in half at 2x eval cost.")
     parser.add_argument("--save-every", type=int, default=5,
                         help="checkpoint 'last' every N updates (best is saved on improvement)")
     parser.add_argument("--out-dir", default="models_multi")

@@ -180,9 +180,21 @@ class ActorCriticTorch(nn.Module if TORCH_AVAILABLE else object):
     def update_ppo(self, obs_np: np.ndarray, actions_np: np.ndarray,
                    old_log_probs_np: np.ndarray, advantages_np: np.ndarray,
                    returns_target_np: np.ndarray, cfg: TrainConfig,
-                   entropy_beta: float) -> dict:
+                   entropy_beta: float,
+                   *,
+                   lr_override: float | None = None,
+                   ppo_clip_override: float | None = None,
+                   target_kl: float | None = None) -> dict:
+        """Per-species overrides match the numpy backend exactly:
+        - lr_override / ppo_clip_override let the trainer dial individual
+          species without mutating the shared TrainConfig
+        - target_kl enables early-stopping the PPO epoch loop when the
+          approximate KL exceeds 1.5x the target (standard PPO refinement)"""
         if obs_np.shape[0] == 0:
-            return {"entropy": 0.0, "value_loss": 0.0, "n": 0, "kl": 0.0, "clip_frac": 0.0}
+            return {"entropy": 0.0, "value_loss": 0.0, "n": 0, "kl": 0.0, "clip_frac": 0.0, "ppo_epochs_run": 0}
+
+        lr = cfg.lr if lr_override is None else lr_override
+        clip_eps = cfg.ppo_clip if ppo_clip_override is None else ppo_clip_override
 
         self.update_ret_stats(returns_target_np)
         rmean = self.ret_mean
@@ -200,22 +212,32 @@ class ActorCriticTorch(nn.Module if TORCH_AVAILABLE else object):
         returns_n = self._to_t(rn_np, torch.float32)
 
         if self._optim is None:
-            self._optim = torch.optim.Adam(self.parameters(), lr=cfg.lr,
+            self._optim = torch.optim.Adam(self.parameters(), lr=lr,
                                            betas=(0.9, 0.999), eps=1e-8)
-        # Keep lr current in case the caller changed it (no-op otherwise).
+        # Keep lr current per-species (overrides take precedence over cfg.lr).
         for g in self._optim.param_groups:
-            g["lr"] = cfg.lr
+            g["lr"] = lr
 
-        last = {"entropy": 0.0, "value_loss": 0.0, "kl": 0.0, "clip_frac": 0.0}
+        last = {"entropy": 0.0, "value_loss": 0.0, "kl": 0.0, "clip_frac": 0.0, "ppo_epochs_run": 0}
 
-        for _ in range(cfg.ppo_epochs):
+        for epoch_idx in range(cfg.ppo_epochs):
             _h, logits, values = self.forward(obs)
             log_probs_all = F.log_softmax(logits, dim=-1)
             new_log_probs = log_probs_all.gather(1, actions.unsqueeze(1)).squeeze(1)
 
             ratio = (new_log_probs - old_log_probs).exp()
+
+            # Early-stop the PPO epoch loop if approximate KL has drifted too
+            # far from the snapshot policy. Standard PPO refinement.
+            with torch.no_grad():
+                approx_kl_t = (old_log_probs - new_log_probs).mean()
+            approx_kl = float(approx_kl_t.item())
+            if target_kl is not None and approx_kl > 1.5 * target_kl:
+                last["ppo_epochs_run"] = epoch_idx
+                break
+
             unclipped = ratio * advantages
-            clipped = torch.clamp(ratio, 1.0 - cfg.ppo_clip, 1.0 + cfg.ppo_clip) * advantages
+            clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * advantages
             policy_loss = -torch.min(unclipped, clipped).mean()
 
             value_loss = 0.5 * (values - returns_n).pow(2).mean()
@@ -232,12 +254,12 @@ class ActorCriticTorch(nn.Module if TORCH_AVAILABLE else object):
             self._optim.step()
 
             with torch.no_grad():
-                clip_frac = ((ratio - 1.0).abs() > cfg.ppo_clip).float().mean().item()
-                kl = (old_log_probs - new_log_probs).mean().item()
+                clip_frac = ((ratio - 1.0).abs() > clip_eps).float().mean().item()
                 last["entropy"] = entropy.item()
                 last["value_loss"] = value_loss.item()
-                last["kl"] = kl
+                last["kl"] = approx_kl
                 last["clip_frac"] = clip_frac
+                last["ppo_epochs_run"] = epoch_idx + 1
 
         last["n"] = int(obs.shape[0])
         return last

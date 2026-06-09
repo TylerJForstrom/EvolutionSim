@@ -145,13 +145,29 @@ Expected output:
 cuda: True | device: NVIDIA GeForce RTX 4090
 ```
 
-Now train:
+Now train. **Recommended command (post-tuning, all the diagnostic-driven
+improvements applied):**
 
 ```bash
-python training/train_multi_agent.py --profile gpu --updates 5000 \
-    --episode-ticks 600 --log-every 50 --log-breakdown-every 200 --save-every 20 \
+python training/train_multi_agent.py --profile gpu \
+    --updates 1500 --episode-ticks 600 \
+    --log-every 25 --log-breakdown-every 100 --save-every 20 \
     --out-dir models_multi
 ```
+
+Why these numbers (vs the older 5000-update suggestion):
+- The first GPU run (440 updates) hit its best at update 105 then plateaued.
+  PPO+GAE converges fast; going past ~1500 mostly burns money.
+- Defaults baked into the trainer now include per-species hyperparameter
+  overrides (herbivore: lower lr + tighter clip, pollinator: entropy floor),
+  KL early-stopping (--target-kl 0.02), 6 eval episodes per update, and an
+  engineer reward nerf.
+- ~15 min wall-clock, ~$0.15 on a 4090-class GPU.
+
+**Before pushing the trained model back: push to git BEFORE terminating the
+pod.** The container disk gets wiped on terminate; if you forget the push
+you'll need to recover from the network volume via S3 (see "Recovery" at
+the bottom).
 
 `--profile gpu` is a preset that sets `--use-torch --device cuda
 --hidden 128 --batch 4 --num-workers 4` for you. You can still override any
@@ -160,7 +176,7 @@ of those individually:
 ```bash
 # Same as above but with batch=6 and a wider net
 python training/train_multi_agent.py --profile gpu --batch 6 --hidden 192 \
-    --updates 5000 --episode-ticks 600 --out-dir models_multi
+    --updates 1500 --episode-ticks 600 --out-dir models_multi
 ```
 
 ### Estimated wall-clock on a 4090 (with --profile gpu)
@@ -308,3 +324,31 @@ a different region or a different GPU.
 
 **SSH disconnects mid-training.** Use `tmux` (see step 5). Training keeps
 running; just reattach next time.
+
+---
+
+## Recovery: I terminated the pod without pushing!
+
+The container disk is gone but the **network volume persists**. If you had
+one attached (RunPod attaches one by default), your `models_multi/` is
+likely still alive on RunPod's S3 storage.
+
+1. RunPod console → **Storage** → confirm the volume still exists
+2. Generate an S3 API key: Settings → S3 API Keys → Create
+3. Locally:
+   ```powershell
+   pip install awscli   # if not installed
+   $env:AWS_ACCESS_KEY_ID = "AK..."
+   $env:AWS_SECRET_ACCESS_KEY = "..."
+
+   # List to confirm files exist (replace bucket name with what RunPod shows)
+   aws s3 ls --region <region> --endpoint-url https://s3api-<region>.runpod.io s3://<bucket>/EvolutionSim/models_multi/best/ --recursive
+
+   # Download
+   cd "C:\Users\tforstrom\Desktop\Adaptive Ecosystem Lab"
+   mkdir shipped_policies -ErrorAction SilentlyContinue
+   aws s3 sync --region <region> --endpoint-url https://s3api-<region>.runpod.io s3://<bucket>/EvolutionSim/models_multi/best/ ./shipped_policies/
+   aws s3 cp --region <region> --endpoint-url https://s3api-<region>.runpod.io s3://<bucket>/EvolutionSim/models_multi/multi_agent_history.json ./shipped_policies/
+   ```
+4. After confirming files are local, **delete the volume** (Storage → click
+   the volume → Delete). $3.50/month otherwise.
