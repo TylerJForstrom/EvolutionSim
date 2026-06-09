@@ -71,10 +71,17 @@ REWARD_CATEGORIES = ("base", "food", "drink", "repro", "engineer_bonus", "threat
 #     policy stuck on one trick). Higher entropy floor keeps exploration.
 #   - predator/decomposer/engineer were stable, no override needed.
 SPECIES_TUNING: dict[int, dict] = {
-    HERBIVORE: {"lr": 0.002, "ppo_clip": 0.1, "entropy_floor": 0.005},
+    # Herbivore: round 1 (lr=0.002, clip=0.1) over-stabilized — KL=0,
+    # clip=0%, ep=1 = barely learning. Loosen back up.
+    HERBIVORE: {"lr": 0.004, "ppo_clip": 0.15, "entropy_floor": 0.005},
     PREDATOR:  {"entropy_decay_frac": 0.4},          # slow decay, same as before
     DECOMPOSER: {},
-    POLLINATOR: {"entropy_floor": 0.01},             # explicit anti-collapse
+    # Pollinator: round 1 (entropy_floor=0.01) didn't actually prevent
+    # entropy collapse — the FLOOR is on the BONUS COEFFICIENT, not on the
+    # measured entropy. Entropy still drifted to 0.16. Bumping the bonus
+    # floor 5x makes the gradient pressure to explore strong enough that
+    # the policy can't collapse onto a single action.
+    POLLINATOR: {"entropy_floor": 0.05},
     ENGINEER:  {},
 }
 # Per-species target KL for PPO early stopping. Defaults to 0.02 (~half of
@@ -720,10 +727,13 @@ def _apply_profile(args: argparse.Namespace) -> None:
             args.device = "cuda" if cuda_available() else "cpu"
         if args.hidden == 64:
             args.hidden = 128
+        # batch 4 -> 6 (more episodes per update = smoother gradient = less
+        # eval variance). num_workers matched so all 6 episodes run in
+        # parallel.
         if args.batch == 2:
-            args.batch = 4
+            args.batch = 6
         if args.num_workers == 0:
-            args.num_workers = 4
+            args.num_workers = 6
         print(
             f"[profile=gpu] use_torch=True device={args.device} hidden={args.hidden} "
             f"batch={args.batch} num_workers={args.num_workers}"

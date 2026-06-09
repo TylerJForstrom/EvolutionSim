@@ -103,12 +103,17 @@ SPECIES_PARAMS: list[dict] = [
         repro_energy=70.0, repro_cost=26.0, repro_chance=0.045,
         eat_rate=0.048, food_energy=55.0, max_count=260, init_count=40,
     ),
-    # ENGINEER — population dominated the first GPU run (10 -> 53 by u=440,
-    # squeezing prey out). repro_chance trimmed 0.025 -> 0.018 to rebalance.
+    # ENGINEER — round 1 nerf (repro_chance 0.025 -> 0.018, bonus 0.05 -> 0.02)
+    # only dropped them from ~53 to ~43 of ~70 total agents — still ~60%
+    # of the ecosystem, still crowding prey out. Round 2 is aggressive:
+    # repro_chance 0.018 -> 0.010, repro_energy 140 -> 180 (much harder to
+    # qualify), max_count 60 -> 35 (hard cap), engineer_bonus 0.02 -> 0.005
+    # in _compute_rewards. Goal: engineer pop ~10-15 in eval so prey have
+    # room to breathe.
     dict(
         speed=0.4, metabolism=0.055, base_energy=88.0, min_age=95, max_age=1500,
-        repro_energy=140.0, repro_cost=60.0, repro_chance=0.018,
-        eat_rate=0.04, food_energy=42.0, max_count=60, init_count=10,
+        repro_energy=180.0, repro_cost=60.0, repro_chance=0.010,
+        eat_rate=0.04, food_energy=42.0, max_count=35, init_count=10,
     ),
 ]
 
@@ -1062,10 +1067,11 @@ class World:
         )
         drink_r = drank * 2.5
         repro_r = offspring * _REPRO_REWARD
-        # Engineer terraforming bonus trimmed 0.05 -> 0.02 — at 0.05 it
-        # accounted for >40% of engineer's total reward in the RunPod run
-        # and they dominated the ecosystem (pop 10 -> 53 over 440 updates).
-        engineer_bonus = np.where(species == ENGINEER, engineered * 0.02, 0.0)
+        # Engineer terraforming bonus: 0.05 -> 0.02 (round 1) wasn't enough,
+        # engineer pop dropped only 53 -> 43. Round 2: 0.02 -> 0.005,
+        # combined with stricter SPECIES_PARAMS gates (repro_energy 140 ->
+        # 180, max_count 60 -> 35), so they no longer crowd the ecosystem.
+        engineer_bonus = np.where(species == ENGINEER, engineered * 0.005, 0.0)
         # Threat coefficient is sizable so prey species get a STRONG signal to
         # flee predators; without this prey policies never learn avoidance
         # before predator policies learn to hunt, and the system collapses.

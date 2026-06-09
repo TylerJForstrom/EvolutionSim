@@ -145,8 +145,9 @@ Expected output:
 cuda: True | device: NVIDIA GeForce RTX 4090
 ```
 
-Now train. **Recommended command (post-tuning, all the diagnostic-driven
-improvements applied):**
+Now train.
+
+**Short run (~25 min, ~$0.15) for testing or quick results:**
 
 ```bash
 python training/train_multi_agent.py --profile gpu \
@@ -155,14 +156,30 @@ python training/train_multi_agent.py --profile gpu \
     --out-dir models_multi
 ```
 
-Why these numbers (vs the older 5000-update suggestion):
-- The first GPU run (440 updates) hit its best at update 105 then plateaued.
-  PPO+GAE converges fast; going past ~1500 mostly burns money.
-- Defaults baked into the trainer now include per-species hyperparameter
-  overrides (herbivore: lower lr + tighter clip, pollinator: entropy floor),
-  KL early-stopping (--target-kl 0.02), 6 eval episodes per update, and an
-  engineer reward nerf.
-- ~15 min wall-clock, ~$0.15 on a 4090-class GPU.
+**Overnight run (~10–12 hr, ~$3) for the best possible model:**
+
+```bash
+python training/train_multi_agent.py --profile gpu \
+    --updates 3000 --episode-ticks 600 \
+    --log-every 50 --log-breakdown-every 200 --save-every 30 \
+    --out-dir models_multi
+```
+
+What `--profile gpu` sets after the round-2 adjustments:
+- `--use-torch --device cuda`
+- `--hidden 128` (wider net is essentially free on GPU)
+- `--batch 6` (was 4 — more episodes per update for smoother gradient)
+- `--num-workers 6` (matches batch)
+
+Other relevant defaults the trainer now uses:
+- Per-species hyperparameter overrides: herbivore loosened (lr=0.004,
+  clip=0.15) after over-stabilization in run 1, pollinator gets a stronger
+  entropy floor (0.05) after entropy collapse in run 1
+- Aggressive engineer nerf (repro_chance=0.010, max_count=35, bonus=0.005)
+  after they dominated 60% of agents in both prior runs
+- KL early-stopping (--target-kl 0.02) prevents over-large updates from
+  slipping through
+- 6 eval episodes per update for low-variance best tracking
 
 **Before pushing the trained model back: push to git BEFORE terminating the
 pod.** The container disk gets wiped on terminate; if you forget the push
