@@ -85,16 +85,17 @@ class ActorCriticTorch(nn.Module if TORCH_AVAILABLE else object):
         self.policy_head = nn.Linear(hidden, action_size, bias=True)
         self.value_head = nn.Linear(hidden, 1, bias=True)
 
-        # Match the numpy version's uniform init range exactly so a parity
-        # check between backends starts from comparable weights.
-        scale1 = 1.0 / math.sqrt(obs_size)
-        scale2 = 1.0 / math.sqrt(hidden)
+        # Orthogonal init per the stable-baselines3 / spinningup PPO recipe.
+        # Numpy backend uses an identical scheme so behaviour is comparable
+        # across backends. The per-layer gains: hidden=1.0 (tanh-friendly),
+        # policy head=0.01 (start near-uniform so PPO doesn't commit before
+        # seeing data), value head=1.0.
         with torch.no_grad():
-            self.l1.weight.uniform_(-scale1, scale1)
+            nn.init.orthogonal_(self.l1.weight, gain=1.0)
             self.l1.bias.zero_()
-            self.policy_head.weight.uniform_(-scale2, scale2)
+            nn.init.orthogonal_(self.policy_head.weight, gain=0.01)
             self.policy_head.bias.zero_()
-            self.value_head.weight.uniform_(-scale2, scale2)
+            nn.init.orthogonal_(self.value_head.weight, gain=1.0)
             self.value_head.bias.zero_()
 
         self.to(self.device)

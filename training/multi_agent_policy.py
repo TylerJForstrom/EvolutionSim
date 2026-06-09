@@ -22,6 +22,28 @@ from dataclasses import dataclass
 import numpy as np
 
 
+def _orthogonal(rng: np.random.Generator, shape: tuple[int, int], gain: float = 1.0) -> np.ndarray:
+    """Saxe-style orthogonal initialization. Generates a 2D matrix where the
+    rows (or cols, whichever fits) are mutually orthogonal — produces a
+    well-conditioned linear map at the start of training.
+
+    Standard PPO best practice over uniform init. The per-layer gain values
+    are picked by the caller (1.0 for tanh hidden, 0.01 for policy head,
+    1.0 for value head — matches stable-baselines3 defaults).
+    """
+    rows, cols = shape
+    if rows >= cols:
+        a = rng.standard_normal((rows, cols))
+        q, r = np.linalg.qr(a)
+        q = q * np.sign(np.diag(r))     # sign correction makes Q unique
+        return gain * q
+    else:
+        a = rng.standard_normal((cols, rows))
+        q, r = np.linalg.qr(a)
+        q = q * np.sign(np.diag(r))
+        return gain * q.T
+
+
 @dataclass
 class TrainConfig:
     lr: float = 0.005
@@ -51,13 +73,16 @@ class ActorCritic:
         self.action_size = action_size
         self.hidden_size = hidden
         self.rng = np.random.default_rng(seed)
-        scale1 = 1.0 / math.sqrt(obs_size)
-        scale2 = 1.0 / math.sqrt(hidden)
-        self.W1 = self.rng.uniform(-scale1, scale1, size=(obs_size, hidden))
+        # Orthogonal init (Saxe et al.) — well-conditioned over depth, the
+        # de facto standard in modern PPO implementations. The per-layer
+        # gains follow the stable-baselines3 / spinningup PPO recipe:
+        # hidden=1.0 (tanh-friendly), policy head=0.01 (start near-uniform
+        # so PPO doesn't commit before it sees any data), value head=1.0.
+        self.W1 = _orthogonal(self.rng, (obs_size, hidden), gain=1.0)
         self.b1 = np.zeros(hidden)
-        self.W2 = self.rng.uniform(-scale2, scale2, size=(hidden, action_size))
+        self.W2 = _orthogonal(self.rng, (hidden, action_size), gain=0.01)
         self.b2 = np.zeros(action_size)
-        self.Wv = self.rng.uniform(-scale2, scale2, size=hidden)
+        self.Wv = _orthogonal(self.rng, (hidden, 1), gain=1.0).reshape(hidden)
         self.bv = 0.0
         # Running return statistics (for normalizing value targets).
         self.ret_mean = 0.0

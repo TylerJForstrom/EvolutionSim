@@ -97,11 +97,13 @@ SPECIES_PARAMS: list[dict] = [
     # so speed bumped a notch more (predator speed is 0.65, pollinator 0.95
     # gives reliable escape margin in unobstructed terrain) and the threat
     # observation/reward terms below widened to give pollinators an earlier
-    # learning signal.
+    # learning signal. init_count 40 -> 60 because despite all the other
+    # fixes pollinators end up at 1-7 in eval — giving them 50% more
+    # starting samples helps the policy learn before predation reduces them.
     dict(
         speed=0.95, metabolism=0.045, base_energy=45.0, min_age=30, max_age=700,
         repro_energy=70.0, repro_cost=26.0, repro_chance=0.045,
-        eat_rate=0.048, food_energy=55.0, max_count=260, init_count=40,
+        eat_rate=0.048, food_energy=55.0, max_count=260, init_count=60,
     ),
     # ENGINEER — round 1 nerf (repro_chance 0.025 -> 0.018, bonus 0.05 -> 0.02)
     # only dropped them from ~53 to ~43 of ~70 total agents — still ~60%

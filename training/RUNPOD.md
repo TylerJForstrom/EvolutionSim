@@ -161,9 +161,18 @@ python training/train_multi_agent.py --profile gpu \
 ```bash
 python training/train_multi_agent.py --profile gpu \
     --updates 3000 --episode-ticks 600 \
+    --hidden 192 --eval-episodes 8 \
     --log-every 50 --log-breakdown-every 200 --save-every 30 \
     --out-dir models_multi
 ```
+
+Why the extra flags for overnight:
+- `--hidden 192` (vs the profile default 128): more network capacity is
+  essentially free on a GPU and may help the slower learners (decomposer,
+  pollinator). Doubles weight count but adds <10% wall-clock.
+- `--eval-episodes 8` (vs default 6): with 3000 updates and a long horizon,
+  the per-update eval-score variance becomes the bottleneck for tracking
+  `best_eval`. 8 episodes cuts variance ~33% vs 6.
 
 What `--profile gpu` sets after the round-2 adjustments:
 - `--use-torch --device cuda`
