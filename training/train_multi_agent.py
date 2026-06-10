@@ -71,17 +71,22 @@ REWARD_CATEGORIES = ("base", "food", "drink", "repro", "engineer_bonus", "threat
 #     policy stuck on one trick). Higher entropy floor keeps exploration.
 #   - predator/decomposer/engineer were stable, no override needed.
 SPECIES_TUNING: dict[int, dict] = {
-    # Herbivore: round 1 (lr=0.002, clip=0.1) over-stabilized — KL=0,
-    # clip=0%, ep=1 = barely learning. Loosen back up.
-    HERBIVORE: {"lr": 0.004, "ppo_clip": 0.15, "entropy_floor": 0.005},
-    PREDATOR:  {"entropy_decay_frac": 0.4},          # slow decay, same as before
+    # Herbivore (round-4): target_kl=0.05 (was 0.02) + entropy_floor=0.012
+    # (was 0.005). Loose target_kl was the critical fix — at 0.02 the
+    # update was hitting the KL ceiling on epoch 1 every step and the
+    # policy froze. 0.05 lets the policy actually move. The smaller
+    # entropy_floor bump (vs. 0.02) leaves enough gradient pressure for
+    # the policy to actually commit to good actions, not stay random.
+    HERBIVORE: {"lr": 0.004, "ppo_clip": 0.15, "entropy_floor": 0.012, "target_kl": 0.05},
+    PREDATOR:  {"entropy_decay_frac": 0.4},
     DECOMPOSER: {},
-    # Pollinator: round 1 (entropy_floor=0.01) didn't actually prevent
-    # entropy collapse — the FLOOR is on the BONUS COEFFICIENT, not on the
-    # measured entropy. Entropy still drifted to 0.16. Bumping the bonus
-    # floor 5x makes the gradient pressure to explore strong enough that
-    # the policy can't collapse onto a single action.
-    POLLINATOR: {"entropy_floor": 0.05},
+    # Pollinator (round-4): entropy_floor=0.12 (was 0.05 which collapsed,
+    # then 0.25 which prevented all learning). 0.12 is the middle: ~2.5x
+    # the failing 0.05 to actually push back against collapse, but well
+    # below the 0.25 that froze the policy at H=2.18 in smoke. target_kl
+    # stays at 0.10 (5x default) so when the policy does find a useful
+    # direction it can take a meaningful step.
+    POLLINATOR: {"entropy_floor": 0.12, "target_kl": 0.10},
     ENGINEER:  {},
 }
 # Per-species target KL for PPO early stopping. Defaults to 0.02 (~half of
@@ -596,11 +601,16 @@ def train(args: argparse.Namespace) -> None:
             )
             sp_beta = max(sp_beta, tune.get("entropy_floor", 0.0))
 
+            # Per-species target_kl override: pollinator/herbivore get more
+            # permissive thresholds because the global 0.02 was killing
+            # their updates at epoch 1 every step. Other species use the
+            # CLI default.
+            sp_target_kl = tune.get("target_kl", args.target_kl if args.target_kl > 0 else None)
             m = policies[sp].update_ppo(
                 obs, acts, old_log_probs, advantages, returns_target, train_cfg, sp_beta,
                 lr_override=tune.get("lr"),
                 ppo_clip_override=tune.get("ppo_clip"),
-                target_kl=args.target_kl if args.target_kl > 0 else None,
+                target_kl=sp_target_kl,
             )
             update_metrics[sp] = m
 
