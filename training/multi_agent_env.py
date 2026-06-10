@@ -1007,11 +1007,32 @@ class World:
                 continue
             # Random gate (sim-style probability per tick).
             rolls = self.rng.random(ready_slots.size)
-            # Population-aware: throttle if at safety cap.
+            # Global population cap: throttle as the species approaches its
+            # absolute safety ceiling.
             current_count = int((self.alive & (self.type == sp)).sum())
             cap = p["max_count"]
             cap_pressure = max(0.0, 1.0 - current_count / cap)
-            chance = p["repro_chance"] * cap_pressure
+            # LOCAL density dependence (true carrying capacity). Without this
+            # a species can pile up in one food-rich patch and reproduce
+            # unchecked — exactly what killed the seedB run: the herbivore
+            # learned "sit on food and breed", exploded to ~100 agents,
+            # overgrazed, and triggered a whole-ecosystem death spiral in the
+            # back half of training. Throttling reproduction by the number of
+            # conspecifics already in the parent's cell makes crowding
+            # suppress breeding the way real resource competition does, so
+            # populations self-limit smoothly instead of boom-busting.
+            same_sp_alive = self.alive & (self.type == sp)
+            sp_cells = self._cell_idx_at(self.x[same_sp_alive], self.y[same_sp_alive])
+            cell_counts = np.bincount(sp_cells, minlength=N_CELLS)
+            parent_cells = self._cell_idx_at(self.x[ready_slots], self.y[ready_slots])
+            local_density = cell_counts[parent_cells]
+            # local_cap: how many conspecifics in one cell before breeding is
+            # fully suppressed there. Small for mobile guilds (herbivore,
+            # pollinator, predator) so they spread out; larger for sessile-ish
+            # decomposers that naturally aggregate on detritus.
+            local_cap = 8.0 if sp == DECOMPOSER else 4.0
+            local_pressure = np.clip(1.0 - local_density / local_cap, 0.0, 1.0)
+            chance = p["repro_chance"] * cap_pressure * local_pressure
             spawn_mask = rolls < chance
             parents = ready_slots[spawn_mask]
             for parent in parents:
@@ -1075,9 +1096,14 @@ class World:
         # 180, max_count 60 -> 35), so they no longer crowd the ecosystem.
         engineer_bonus = np.where(species == ENGINEER, engineered * 0.005, 0.0)
         # Threat coefficient is sizable so prey species get a STRONG signal to
-        # flee predators; without this prey policies never learn avoidance
-        # before predator policies learn to hunt, and the system collapses.
-        threat_pen = threat * 1.4
+        # flee predators. But the pollinator's task — find sparse nectar AND
+        # flee — was so punishing (threat was ~44% of their total reward,
+        # entropy collapsed every run) that no entropy tuning rescued it.
+        # Halving the pollinator's threat weight leaves them a clear "go to
+        # nectar" gradient while keeping the herbivore's strong avoidance
+        # signal intact.
+        threat_weight = np.where(species == POLLINATOR, 0.7, 1.4)
+        threat_pen = threat * threat_weight
         condition_pen = (
             np.maximum(0.0, hunger - 60.0) * 0.004
             + np.maximum(0.0, thirst - 60.0) * 0.005

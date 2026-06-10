@@ -77,16 +77,21 @@ SPECIES_TUNING: dict[int, dict] = {
     # policy froze. 0.05 lets the policy actually move. The smaller
     # entropy_floor bump (vs. 0.02) leaves enough gradient pressure for
     # the policy to actually commit to good actions, not stay random.
-    HERBIVORE: {"lr": 0.004, "ppo_clip": 0.15, "entropy_floor": 0.012, "target_kl": 0.05},
+    # Herbivore: keep the looser target_kl=0.05 that unfroze it, but the
+    # entropy floor can come back down to 0.008 now that local density-
+    # dependent reproduction (env) stops the population-explosion exploit
+    # the high floor was indirectly guarding against.
+    HERBIVORE: {"lr": 0.004, "ppo_clip": 0.15, "entropy_floor": 0.008, "target_kl": 0.05},
     PREDATOR:  {"entropy_decay_frac": 0.4},
     DECOMPOSER: {},
-    # Pollinator (round-4): entropy_floor=0.12 (was 0.05 which collapsed,
-    # then 0.25 which prevented all learning). 0.12 is the middle: ~2.5x
-    # the failing 0.05 to actually push back against collapse, but well
-    # below the 0.25 that froze the policy at H=2.18 in smoke. target_kl
-    # stays at 0.10 (5x default) so when the policy does find a useful
-    # direction it can take a meaningful step.
-    POLLINATOR: {"entropy_floor": 0.12, "target_kl": 0.10},
+    # Pollinator (round-5): the entropy lever was a dead end — 0.05
+    # collapsed, 0.12 froze the policy at near-random for 900 updates then
+    # collapsed anyway, 0.25 never learned. The actual problem was the
+    # reward landscape (threat was ~44% of total reward). With the threat
+    # weight halved in the env, the task is learnable, so the floor comes
+    # back to a modest 0.03 — enough to discourage total collapse without
+    # paralysing learning. Keep the looser target_kl.
+    POLLINATOR: {"entropy_floor": 0.03, "target_kl": 0.10},
     ENGINEER:  {},
 }
 # Per-species target KL for PPO early stopping. Defaults to 0.02 (~half of
