@@ -764,10 +764,25 @@ class World:
         plant_biomass = float(self.vegetation.sum())
         detritus_pool = float(self.detritus.sum())
         herb_count = int((self.alive & (self.type == HERBIVORE)).sum())
+        poll_count = int((self.alive & (self.type == POLLINATOR)).sum())
+        # Predators are rescued on a PREY-availability gate, not "herbivores
+        # already exploded". The old gate (herb_count > 40) could only fire
+        # AFTER the herbivore explosion, by which point the predator policy had
+        # already mode-collapsed; during the slow predator decline (herbivores
+        # held at 1-3 by predation) it never fired, so predators got no support
+        # until it was too late. Gating on the standing prey base (herbivores +
+        # pollinators) lets the rescue bolster predators DURING the decline, so
+        # a functional-policy (see predator entropy_floor) predator nucleus is
+        # still present to re-suppress herbivores when they rebound. Threshold/
+        # count raised 2/2 -> 4/3 so the refill seeds a small breeding nucleus
+        # rather than two soon-dead individuals. Still a low floor, not pegging:
+        # in the healthy regime predators sit at 5-14 (well above 4) so it never
+        # fires there.
+        prey_base = herb_count + poll_count
         rules = [
             (HERBIVORE,   4, 4, plant_biomass > 30.0),
             (POLLINATOR,  4, 4, plant_biomass > 20.0),
-            (PREDATOR,    2, 2, herb_count > 40),
+            (PREDATOR,    4, 3, prey_base >= 6),
             (DECOMPOSER,  4, 4, detritus_pool > 5.0),
             (ENGINEER,    3, 3, plant_biomass > 20.0),
         ]
