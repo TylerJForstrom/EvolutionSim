@@ -49,9 +49,9 @@ def cuda_available() -> bool:
     return TORCH_AVAILABLE and torch.cuda.is_available()
 
 
-# We reuse TrainConfig from the numpy module so the trainer doesn't care
-# which backend it picks.
-from multi_agent_policy import TrainConfig  # noqa: E402
+# We reuse TrainConfig and the shared PPO log-ratio clamp from the numpy module
+# so the two backends stay mathematically equivalent.
+from multi_agent_policy import TrainConfig, PPO_LOGRATIO_CLAMP  # noqa: E402
 
 
 class ActorCriticTorch(nn.Module if TORCH_AVAILABLE else object):
@@ -226,7 +226,13 @@ class ActorCriticTorch(nn.Module if TORCH_AVAILABLE else object):
             log_probs_all = F.log_softmax(logits, dim=-1)
             new_log_probs = log_probs_all.gather(1, actions.unsqueeze(1)).squeeze(1)
 
-            ratio = (new_log_probs - old_log_probs).exp()
+            # Clamp the log-ratio before exp so `ratio` can never overflow
+            # float32 (see PPO_LOGRATIO_CLAMP in multi_agent_policy). clamp()'s
+            # zero gradient outside the range also freezes pathological samples,
+            # matching the numpy backend's `saturated` mask. No-op in the
+            # normal regime.
+            log_ratio = (new_log_probs - old_log_probs).clamp(-PPO_LOGRATIO_CLAMP, PPO_LOGRATIO_CLAMP)
+            ratio = log_ratio.exp()
 
             # Early-stop the PPO epoch loop if approximate KL has drifted too
             # far from the snapshot policy. Standard PPO refinement.
@@ -247,6 +253,14 @@ class ActorCriticTorch(nn.Module if TORCH_AVAILABLE else object):
             entropy = -(probs * log_probs_all).sum(dim=-1).mean()
 
             total_loss = policy_loss + cfg.value_coef * value_loss - entropy_beta * entropy
+
+            # Non-finite guard: skip this and remaining epochs instead of
+            # stepping NaN/inf into the weights (which corrupts the policy
+            # permanently). With the log-ratio clamp this should never fire,
+            # but it also catches value-head divergence and other paths.
+            if not torch.isfinite(total_loss):
+                last["ppo_epochs_run"] = epoch_idx
+                break
 
             self._optim.zero_grad()
             total_loss.backward()

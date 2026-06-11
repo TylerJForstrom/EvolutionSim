@@ -22,6 +22,18 @@ from dataclasses import dataclass
 import numpy as np
 
 
+# PPO numerical-stability clamp on the log-probability ratio. The clipped
+# surrogate only cares about `ratio` near 1 (with ppo_clip=0.2 the live region
+# is ratio in ~[0.8, 1.2], i.e. log_ratio in ~[-0.22, 0.18]), so clamping the
+# log-ratio to +/-20 before exp() is a no-op in any healthy update. It only
+# matters in the degenerate regime where a near-deterministic snapshot assigned
+# an almost-zero probability to a sampled action: there log_ratio can reach ~+90
+# and exp(90) overflows float32 in the torch backend, producing inf -> NaN ->
+# permanent weight corruption. exp(20) ~= 4.85e8 is safe in both float32 and
+# float64. Both backends apply this identically so they stay equivalent.
+PPO_LOGRATIO_CLAMP = 20.0
+
+
 def _orthogonal(rng: np.random.Generator, shape: tuple[int, int], gain: float = 1.0) -> np.ndarray:
     """Saxe-style orthogonal initialization. Generates a 2D matrix where the
     rows (or cols, whichever fits) are mutually orthogonal — produces a
@@ -310,7 +322,10 @@ class ActorCritic:
             hidden, probs, value = self.forward(obs)
 
             new_log_probs = np.log(probs[np.arange(N), actions] + 1e-12)
-            ratios = np.exp(new_log_probs - old_log_probs)
+            log_ratio = new_log_probs - old_log_probs
+            # Clamp the log-ratio before exp so `ratio` can never overflow
+            # (see PPO_LOGRATIO_CLAMP). No-op in the normal regime.
+            ratios = np.exp(np.clip(log_ratio, -PPO_LOGRATIO_CLAMP, PPO_LOGRATIO_CLAMP))
 
             # Approximate KL between snapshot and current — used both as a
             # diagnostic and (when target_kl is set) for early stopping.
@@ -327,7 +342,13 @@ class ActorCritic:
             clipped_high = (adv > 0) & (ratios > 1.0 + clip_eps)
             clipped_low = (adv < 0) & (ratios < 1.0 - clip_eps)
             clipped = clipped_high | clipped_low
-            coef = np.where(clipped, 0.0, ratios * adv)
+            # Samples whose log-ratio saturated the safety clamp are pathological
+            # (snapshot vs current policy disagree wildly); freeze their policy
+            # gradient to zero so one such sample can't dominate the grad-norm-
+            # clipped update. The torch backend gets this for free from clamp()'s
+            # zero gradient.
+            saturated = np.abs(log_ratio) > PPO_LOGRATIO_CLAMP
+            coef = np.where(clipped | saturated, 0.0, ratios * adv)
 
             # Policy gradient on logits: coef * (1{a=action} - p_a)
             onehot = np.zeros_like(probs)
@@ -359,6 +380,12 @@ class ActorCritic:
             # Global grad-norm clip.
             grads = [gW1, gb1, gW2, gb2, gWv, np.array([gbv])]
             norm = math.sqrt(sum(float((g * g).sum()) for g in grads))
+            # Non-finite guard: if any gradient went inf/nan (e.g. a value-head
+            # divergence), skip this and remaining epochs rather than writing
+            # NaNs into the weights, which would corrupt the policy permanently.
+            if not math.isfinite(norm):
+                last["ppo_epochs_run"] = epoch_idx
+                break
             clip_factor = min(1.0, cfg.grad_clip / (norm + 1e-12)) if cfg.grad_clip > 0 else 1.0
             gW1 *= clip_factor; gb1 *= clip_factor; gW2 *= clip_factor
             gb2 *= clip_factor; gWv *= clip_factor; gbv *= clip_factor
