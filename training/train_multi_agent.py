@@ -82,8 +82,24 @@ SPECIES_TUNING: dict[int, dict] = {
     # dependent reproduction (env) stops the population-explosion exploit
     # the high floor was indirectly guarding against.
     HERBIVORE: {"lr": 0.004, "ppo_clip": 0.15, "entropy_floor": 0.008, "target_kl": 0.05},
-    PREDATOR:  {"entropy_decay_frac": 0.4},
-    DECOMPOSER: {},
+    # Predator (round-6): add entropy_floor=0.02. The 5000-update history shows
+    # predator entropy fall off a cliff (0.63 at u=1500 -> 0.000 at u=1650) at
+    # the exact moment its population dipped to ~2 — a policy mode-collapse. Once
+    # collapsed, the greedy-eval predator can't hunt even when herbivores then
+    # explode to 67, so it never re-establishes top-down control and the food
+    # web dies. The slow entropy decay (decay_frac=0.4) was not enough on its
+    # own: in a small, noisy late-training batch the policy gradient swamps the
+    # tiny scheduled entropy bonus. A 0.02 floor (above the 0.015 schedule init,
+    # so effectively constant) keeps enough exploration pressure that the policy
+    # stays stochastic through low-population troughs and can recover when prey
+    # rebound. decay_frac is now inert (floor dominates) but kept for intent.
+    PREDATOR:  {"entropy_decay_frac": 0.4, "entropy_floor": 0.02},
+    # Decomposer (round-6): add entropy_floor=0.01. Decomposer entropy stayed
+    # healthy (~1.5) until the ecosystem crashed, then decayed to 0.005 and was
+    # the first species to go NaN (u=3875). A modest floor is anti-collapse
+    # insurance for the degenerate post-crash regime; it barely moves the
+    # default 0.005 schedule final otherwise.
+    DECOMPOSER: {"entropy_floor": 0.01},
     # Pollinator (round-5): the entropy lever was a dead end — 0.05
     # collapsed, 0.12 froze the policy at near-random for 900 updates then
     # collapsed anyway, 0.25 never learned. The actual problem was the
