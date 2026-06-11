@@ -56,12 +56,25 @@ OBS_DIM = 28
 
 # Per-species ecological parameters (mirroring sim.js TYPE_INFO, rescaled for
 # the smaller grid and shorter year). max_count is a non-binding safety rail.
+#
+# carry_k is the ECOLOGICAL global carrying capacity: reproduction is throttled
+# smoothly toward zero as the live count of a species approaches carry_k (see
+# _do_reproduction). The previous global throttle used max_count, which is set
+# so high (e.g. herbivore=420) that it never engaged — herbivores spread across
+# the whole 64x48 map kept the per-cell local cap from engaging too, so once
+# predators thinned out the herbivore population exploded to ~67, overgrazed,
+# and boom-bust-crashed the food web (the back-3500-update collapse). carry_k
+# adds the missing density-dependent negative feedback at the WHOLE-population
+# scale so an escaped guild plateaus at a sustainable level instead of
+# overshooting. Species that never overshot keep carry_k == max_count, so their
+# behavior is unchanged.
 SPECIES_PARAMS: list[dict] = [
     # HERBIVORE
     dict(
         speed=0.55, metabolism=0.045, base_energy=72.0, min_age=60, max_age=1500,
         repro_energy=100.0, repro_cost=35.0, repro_chance=0.045,
         eat_rate=0.06, food_energy=48.0, max_count=420, init_count=80,
+        carry_k=34,
     ),
     # PREDATOR. Iterative tuning history:
     # - Round 1 (first multi-agent run): predator reward dominated by sparse
@@ -82,13 +95,14 @@ SPECIES_PARAMS: list[dict] = [
         repro_energy=110.0, repro_cost=38.0, repro_chance=0.022,
         eat_rate=0.0, food_energy=0.0, max_count=80, init_count=14,
         attack=0.28, handling_min=22, handling_max=40, capture_radius=1.55,
-        assimilation=0.17,
+        assimilation=0.17, carry_k=80,
     ),
     # DECOMPOSER
     dict(
         speed=0.4, metabolism=0.044, base_energy=58.0, min_age=35, max_age=620,
         repro_energy=100.0, repro_cost=38.0, repro_chance=0.018,
         eat_rate=0.06, food_energy=50.0, max_count=220, init_count=30,
+        carry_k=220,  # == max_count: decomposers crashed (never overshot), no change
     ),
     # POLLINATOR — eat_rate raised because the breakdown showed pollinators
     # earning only 1.3% of their reward from food; they were dying of
@@ -104,6 +118,7 @@ SPECIES_PARAMS: list[dict] = [
         speed=0.95, metabolism=0.045, base_energy=45.0, min_age=30, max_age=700,
         repro_energy=70.0, repro_cost=26.0, repro_chance=0.045,
         eat_rate=0.048, food_energy=55.0, max_count=260, init_count=60,
+        carry_k=80,  # insurance: pollinators are prey too and could bloom if predators die
     ),
     # ENGINEER — round 1 nerf (repro_chance 0.025 -> 0.018, bonus 0.05 -> 0.02)
     # only dropped them from ~53 to ~43 of ~70 total agents — still ~60%
@@ -116,6 +131,7 @@ SPECIES_PARAMS: list[dict] = [
         speed=0.4, metabolism=0.055, base_energy=88.0, min_age=95, max_age=1500,
         repro_energy=180.0, repro_cost=60.0, repro_chance=0.010,
         eat_rate=0.04, food_energy=42.0, max_count=35, init_count=10,
+        carry_k=35,  # == max_count: engineers already hard-capped intentionally
     ),
 ]
 
@@ -1007,10 +1023,14 @@ class World:
                 continue
             # Random gate (sim-style probability per tick).
             rolls = self.rng.random(ready_slots.size)
-            # Global population cap: throttle as the species approaches its
-            # absolute safety ceiling.
+            # Global carrying-capacity throttle (true density dependence at the
+            # whole-population scale). As the live count approaches carry_k,
+            # reproduction is suppressed toward zero, so an escaped guild
+            # plateaus at a sustainable level instead of overshooting and
+            # crashing the food web. carry_k defaults to max_count for species
+            # that never overshot, leaving them unchanged.
             current_count = int((self.alive & (self.type == sp)).sum())
-            cap = p["max_count"]
+            cap = p.get("carry_k", p["max_count"])
             cap_pressure = max(0.0, 1.0 - current_count / cap)
             # LOCAL density dependence (true carrying capacity). Without this
             # a species can pile up in one food-rich patch and reproduce
