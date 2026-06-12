@@ -1,0 +1,3 @@
+run 1  seed=3714  out=models_seed_3714
+run 2  seed=8887  out=models_seed_8887
+run 3  seed=17216  out=models_seed_17216
