@@ -582,6 +582,10 @@ def train(args: argparse.Namespace) -> None:
     # run), so the checkpoint format stays untouched.
     adaptive_beta: dict[int, float] = {}
 
+    # --eval-every carry-forward + --abort-on-collapse state.
+    last_eval_result: dict | None = None
+    collapse_streak = 0
+
     for update in range(start_update, args.updates + 1):
         frac = update / args.updates
         # The default linear-decay schedule (used by species not in
@@ -702,15 +706,32 @@ def train(args: argparse.Namespace) -> None:
             update_metrics[sp] = m
 
         # --- Multi-seed greedy eval (parallelised via pool if available) ---
-        eval_result = evaluate(
-            world, policies, args.episode_ticks, eval_seed_base, args.eval_episodes,
-            pool=pool,
+        # Eval is monitoring-only (best-tracking + logging); it does NOT affect
+        # training. Running it every update is the single biggest per-update
+        # cost (eval_episodes greedy episodes on top of the rollout), so
+        # --eval-every>1 amortises it: eval on the schedule, carry the last
+        # result forward otherwise. At eval_episodes=8 a --eval-every 10 run
+        # roughly halves wall-clock (and GPU cost) for only coarser best-
+        # checkpoint timing. Always eval on the first/last update.
+        do_eval = (
+            update == start_update or update == args.updates
+            or update % args.eval_every == 0
         )
-        eval_score = eval_result["eval_score"]
-
-        new_best = eval_score > best_eval_score
-        if new_best:
-            best_eval_score = eval_score
+        if do_eval:
+            eval_result = evaluate(
+                world, policies, args.episode_ticks, eval_seed_base, args.eval_episodes,
+                pool=pool,
+            )
+            last_eval_result = eval_result
+            eval_score = eval_result["eval_score"]
+            new_best = eval_score > best_eval_score
+            if new_best:
+                best_eval_score = eval_score
+        else:
+            # Carry the last eval forward so logging/history stay per-update.
+            eval_result = last_eval_result
+            eval_score = eval_result["eval_score"]
+            new_best = False
 
         # --- Log ---
         elapsed = time.time() - t_start
@@ -764,8 +785,25 @@ def train(args: argparse.Namespace) -> None:
         if args.save_every > 0 and (update % args.save_every == 0 or update == args.updates):
             save_checkpoint(out_dir, "last", policies, history, best_eval_score, update, save_adam=True, use_torch=use_torch)
 
-    # --- Final save ---
-    save_checkpoint(out_dir, "last", policies, history, best_eval_score, args.updates, save_adam=True, use_torch=use_torch)
+        # --- Early abort on sustained collapse (opt-in, conservative) ---
+        # Stops paying for a dead run. Fires only well past the early phase,
+        # only after the run had actually been healthy (best>20), and only when
+        # the ecosystem reward has stayed negative across several consecutive
+        # evals -- a state the adaptive-entropy fix is meant to prevent, so a
+        # healthy run never trips it. The `best/` checkpoint (the model you
+        # ship) was already saved at the peak, so nothing valuable is lost.
+        if args.abort_on_collapse and do_eval:
+            collapsed_now = update > 1500 and best_eval_score > 20.0 and eval_score < 0.0
+            collapse_streak = collapse_streak + 1 if collapsed_now else 0
+            if collapse_streak >= 5:
+                print(f"[abort-on-collapse] eval_score negative for {collapse_streak} consecutive "
+                      f"evals (best was {best_eval_score:.1f}); collapse confirmed, stopping at "
+                      f"u={update} to save GPU time.")
+                break
+
+    # --- Final save (uses the actual last update reached, so an aborted run
+    # resumes from the right place rather than args.updates). ---
+    save_checkpoint(out_dir, "last", policies, history, best_eval_score, update, save_adam=True, use_torch=use_torch)
     if pool is not None:
         pool.close()
         pool.join()
@@ -797,6 +835,10 @@ def parse_args() -> argparse.Namespace:
                         help="log per-species reward breakdown every N updates (0 to disable)")
     parser.add_argument("--eval-episodes", type=int, default=6,
                         help="number of greedy eval episodes per update. Bumped from 3 -> 6 because at 3 episodes the eval_score variance was ±50 across updates which made best_eval tracking noisy. 6 cuts that variance roughly in half at 2x eval cost.")
+    parser.add_argument("--eval-every", type=int, default=1,
+                        help="run greedy eval only every N updates (carry the last result forward between); the first and last update always eval. Eval is monitoring-only so this doesn't affect training -- it's the cheapest way to cut wall-clock/GPU cost. eval-every 10 roughly halves cost. Pick a value that divides --log-every so logged updates show a fresh eval.")
+    parser.add_argument("--abort-on-collapse", action="store_true",
+                        help="stop the run early once it's definitively collapsed (eval_score stays negative for 5 consecutive evals past update 1500, after having been healthy). Saves GPU time on a dead run; the best/ checkpoint was already saved at the peak. Conservative -- a healthy run never trips it.")
     parser.add_argument("--save-every", type=int, default=5,
                         help="checkpoint 'last' every N updates (best is saved on improvement)")
     parser.add_argument("--out-dir", default="models_multi")
