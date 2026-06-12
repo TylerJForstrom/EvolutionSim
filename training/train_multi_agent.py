@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import multiprocessing as mp
 import sys
 import time
@@ -93,7 +94,18 @@ SPECIES_TUNING: dict[int, dict] = {
     # so effectively constant) keeps enough exploration pressure that the policy
     # stays stochastic through low-population troughs and can recover when prey
     # rebound. decay_frac is now inert (floor dominates) but kept for intent.
-    PREDATOR:  {"entropy_decay_frac": 0.4, "entropy_floor": 0.02},
+    # Predator (round-7): add entropy_target=0.7 for the adaptive controller.
+    # The round-2 3-seed run on the fix branch showed the floor=0.02 was still
+    # too weak: predator entropy held ~1.0-1.2 until u~2000-2500 then cliffed to
+    # 0 in all three seeds while the population (5-8) and batch (25-45k) stayed
+    # healthy -- a pure policy mode-collapse, not starvation. Once at entropy 0
+    # the deterministic policy is stuck (no gradient variance to escape) and
+    # can't hunt, cratering eval. A fixed coefficient can't hold the line
+    # because the sharpening pressure from the sparse kill reward grows; the
+    # adaptive controller raises beta only when entropy falls below 0.7, so it
+    # clamps the collapse without over-exploring early. floor stays the relax
+    # target; decay_frac is inert.
+    PREDATOR:  {"entropy_decay_frac": 0.4, "entropy_floor": 0.02, "entropy_target": 0.7},
     # Decomposer (round-6): add entropy_floor=0.01. Decomposer entropy stayed
     # healthy (~1.5) until the ecosystem crashed, then decayed to 0.005 and was
     # the first species to go NaN (u=3875). A modest floor is anti-collapse
@@ -107,9 +119,40 @@ SPECIES_TUNING: dict[int, dict] = {
     # weight halved in the env, the task is learnable, so the floor comes
     # back to a modest 0.03 — enough to discourage total collapse without
     # paralysing learning. Keep the looser target_kl.
-    POLLINATOR: {"entropy_floor": 0.03, "target_kl": 0.10},
+    # Pollinator (round-7): add entropy_target=0.9. Same collapse as the
+    # predator in the round-2 run -- the other sparse-reward forager. Its
+    # healthy entropy runs higher (~1.9) but it cliffed to 0.12 despite the
+    # 0.03 floor; target 0.9 holds it well clear of the stuck-at-zero state
+    # without forcing the near-random over-exploration that froze it in
+    # round-5. Keep the looser target_kl.
+    POLLINATOR: {"entropy_floor": 0.03, "target_kl": 0.10, "entropy_target": 0.9},
     ENGINEER:  {},
 }
+
+# Adaptive entropy controller. For species with an `entropy_target` in
+# SPECIES_TUNING, the entropy coefficient is steered after each update to hold
+# the policy's entropy near the target: raised when entropy falls below it,
+# relaxed back toward the floor when entropy sits comfortably above. This beats
+# a fixed coefficient for the sparse-reward foragers (predator, pollinator),
+# whose peaked rewards drive hard policy sharpening that even a 0.03 floor
+# couldn't counter -- in the round-2 run their entropy cliffed to ~0 and the
+# deterministic policy got stuck (couldn't hunt/forage), cratering eval. The
+# update is multiplicative in log-space and clamped to [entropy_floor,
+# ADAPTIVE_ENTROPY_CEILING], so it can never force a uniform-random policy. The
+# coefficient is computed in the trainer and passed identically to both the
+# numpy and torch update_ppo, so the backends stay equivalent.
+ADAPTIVE_ENTROPY_RATE = 0.7       # log-beta step per unit (target - entropy) error
+ADAPTIVE_ENTROPY_CEILING = 0.6    # hard cap on the entropy coefficient
+
+
+def _adapt_entropy_beta(beta: float, entropy: float, target: float, floor: float) -> float:
+    """One step of the adaptive entropy controller: nudge `beta` to drive the
+    policy's measured `entropy` toward `target`. Multiplicative in log-space
+    (raise beta when entropy < target, lower it when above), clamped to
+    [floor, ADAPTIVE_ENTROPY_CEILING] so it can never force a uniform-random
+    policy. Pure/stateless so it can be unit-tested."""
+    step = math.exp(ADAPTIVE_ENTROPY_RATE * (target - entropy))
+    return float(min(ADAPTIVE_ENTROPY_CEILING, max(floor, beta * step)))
 # Per-species target KL for PPO early stopping. Defaults to 0.02 (~half of
 # the OpenAI PPO recommended target_kl=0.04) which is conservative.
 DEFAULT_TARGET_KL = 0.02
@@ -532,6 +575,13 @@ def train(args: argparse.Namespace) -> None:
         pool = mp.Pool(processes=pool_size)
         print(f"using {pool_size} parallel episode workers")
 
+    # Adaptive entropy coefficient state, persisted across updates for species
+    # that set an `entropy_target`. None until a controller first fires; then a
+    # float in [floor, ADAPTIVE_ENTROPY_CEILING]. Re-initialised on resume (it
+    # re-adapts within ~10-20 updates, negligible over a multi-thousand-update
+    # run), so the checkpoint format stays untouched.
+    adaptive_beta: dict[int, float] = {}
+
     for update in range(start_update, args.updates + 1):
         frac = update / args.updates
         # The default linear-decay schedule (used by species not in
@@ -622,6 +672,15 @@ def train(args: argparse.Namespace) -> None:
             )
             sp_beta = max(sp_beta, tune.get("entropy_floor", 0.0))
 
+            # Adaptive entropy targeting for the sparse-reward foragers
+            # (predator, pollinator). If a target is set, use the running
+            # adaptive coefficient as this update's beta (seeded from the
+            # schedule on first use); it gets steered after the update below.
+            entropy_target = tune.get("entropy_target")
+            entropy_floor = tune.get("entropy_floor", 0.0)
+            if entropy_target is not None:
+                sp_beta = adaptive_beta.setdefault(sp, max(sp_beta, entropy_floor))
+
             # Per-species target_kl override: pollinator/herbivore get more
             # permissive thresholds because the global 0.02 was killing
             # their updates at epoch 1 every step. Other species use the
@@ -633,6 +692,13 @@ def train(args: argparse.Namespace) -> None:
                 ppo_clip_override=tune.get("ppo_clip"),
                 target_kl=sp_target_kl,
             )
+            m["entropy_beta"] = float(sp_beta)
+            # Steer the adaptive coefficient from the entropy this update
+            # produced, ready for the next update.
+            if entropy_target is not None and np.isfinite(m.get("entropy", float("nan"))):
+                adaptive_beta[sp] = _adapt_entropy_beta(
+                    adaptive_beta[sp], m["entropy"], entropy_target, entropy_floor,
+                )
             update_metrics[sp] = m
 
         # --- Multi-seed greedy eval (parallelised via pool if available) ---
@@ -666,9 +732,12 @@ def train(args: argparse.Namespace) -> None:
                 kl = m.get("kl", 0.0)
                 clip_frac = m.get("clip_frac", 0.0)
                 eps = m.get("ppo_epochs_run", train_cfg.ppo_epochs)
+                # eb = entropy coefficient (adaptive for predator/pollinator);
+                # watch it ramp up if their H drifts toward the target.
+                eb = m.get("entropy_beta", 0.0)
                 print(
                     f"    {SPECIES_NAMES[sp][:4]:>4}: train_r={train_r:6.2f} eval_r={eval_r:6.2f} life={avg_life:5.1f} "
-                    f"H={m['entropy']:.2f} vL={m['value_loss']:.2f} KL={kl:+.3f} clip={clip_frac*100:4.1f}% ep={eps} n={m['n']}"
+                    f"H={m['entropy']:.2f} eb={eb:.3f} vL={m['value_loss']:.2f} KL={kl:+.3f} clip={clip_frac*100:4.1f}% ep={eps} n={m['n']}"
                 )
         if log_breakdown:
             print("    -- reward breakdown (% of total positive + negative reward per species, from eval) --")
