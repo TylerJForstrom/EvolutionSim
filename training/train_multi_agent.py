@@ -105,7 +105,18 @@ SPECIES_TUNING: dict[int, dict] = {
     # adaptive controller raises beta only when entropy falls below 0.7, so it
     # clamps the collapse without over-exploring early. floor stays the relax
     # target; decay_frac is inert.
-    PREDATOR:  {"entropy_decay_frac": 0.4, "entropy_floor": 0.02, "entropy_target": 0.7},
+    # Predator (round-8): add lr=0.0025 (was the global default 0.005). The
+    # round-3 3-seed run showed adaptive entropy delayed the collapse (to
+    # u~3500) and raised the peak (to 184.7), but the predator policy still
+    # sharpens to determinism on its own -- and the seed that sharpened SLOWEST
+    # peaked HIGHEST. Even the controller pinned at its ceiling couldn't reverse
+    # a fast sharpening, and pushing entropy harder just makes the predator
+    # random (also useless). So the real lever is the learning rate: a gentler
+    # lr slows the sharpening at the source, stretching out the collapse (likely
+    # past 5000) and letting the peak keep climbing. Kept close to the prey lr
+    # (herbivore 0.004) so the predator isn't out-evolved in the arms race.
+    # --pred-lr overrides this for the per-seed LR sweep.
+    PREDATOR:  {"entropy_decay_frac": 0.4, "entropy_floor": 0.02, "entropy_target": 0.7, "lr": 0.0025},
     # Decomposer (round-6): add entropy_floor=0.01. Decomposer entropy stayed
     # healthy (~1.5) until the ecosystem crashed, then decayed to 0.005 and was
     # the first species to go NaN (u=3875). A modest floor is anti-collapse
@@ -141,8 +152,13 @@ SPECIES_TUNING: dict[int, dict] = {
 # ADAPTIVE_ENTROPY_CEILING], so it can never force a uniform-random policy. The
 # coefficient is computed in the trainer and passed identically to both the
 # numpy and torch update_ppo, so the backends stay equivalent.
-ADAPTIVE_ENTROPY_RATE = 0.7       # log-beta step per unit (target - entropy) error
-ADAPTIVE_ENTROPY_CEILING = 0.6    # hard cap on the entropy coefficient
+# Round-8: gain 0.7 -> 0.4 because the round-3 fine-grained logs showed the
+# coefficient slamming floor<->ceiling (0.04 <-> 0.6) and dragging entropy with
+# it; a gentler gain regulates smoothly instead of oscillating. Ceiling 0.6 ->
+# 0.9 gives a bit more authority, though with the lower predator lr the decay
+# is slower and the controller shouldn't need to reach for it.
+ADAPTIVE_ENTROPY_RATE = 0.4       # log-beta step per unit (target - entropy) error
+ADAPTIVE_ENTROPY_CEILING = 0.9    # hard cap on the entropy coefficient
 
 
 def _adapt_entropy_beta(beta: float, entropy: float, target: float, floor: float) -> float:
@@ -527,6 +543,13 @@ def train(args: argparse.Namespace) -> None:
         hidden=args.hidden,
     )
 
+    # Optional predator-LR override (for the LR sweep). SPECIES_TUNING is read
+    # only in this (main) process's update loop, never in the rollout workers,
+    # so mutating it here is safe.
+    if args.pred_lr is not None:
+        SPECIES_TUNING[PREDATOR] = {**SPECIES_TUNING[PREDATOR], "lr": args.pred_lr}
+        print(f"[pred-lr] predator learning rate overridden to {args.pred_lr}")
+
     out_dir = Path(args.out_dir)
 
     # --- Backend selection -------------------------------------------------
@@ -822,6 +845,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden", type=int, default=64, help="hidden layer width per species (only used on fresh starts; resumes read it from the checkpoint). 128 gives slightly better quality at ~4x wall-clock; 64 is the sweet spot for pure-numpy on CPU.")
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--lr", type=float, default=0.005)
+    parser.add_argument("--pred-lr", type=float, default=None,
+                        help="override the predator's learning rate (default from SPECIES_TUNING, 0.0025). The predator is the species that mode-collapses; a gentler lr slows the policy sharpening that drives it. Exposed for the per-seed LR sweep (run each seed at a different value and keep the best).")
     parser.add_argument("--clip", type=float, default=5.0)
     parser.add_argument("--entropy-beta", type=float, default=0.015)
     parser.add_argument("--entropy-final", type=float, default=0.005,
