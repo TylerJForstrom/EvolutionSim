@@ -1,0 +1,3 @@
+run 1  seed=27232  pred_lr=0.002  out=models_seed_27232
+run 2  seed=25168  pred_lr=0.0025  out=models_seed_25168
+run 3  seed=9710  pred_lr=0.003  out=models_seed_9710
