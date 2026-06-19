@@ -161,6 +161,16 @@ ADAPTIVE_ENTROPY_RATE = 0.4       # log-beta step per unit (target - entropy) er
 ADAPTIVE_ENTROPY_CEILING = 0.9    # hard cap on the entropy coefficient
 
 
+def _decayed_lr(lr_start: float, lr_final: float, frac: float) -> float:
+    """Linear learning-rate decay over the run (frac in [0,1]). Used for the
+    predator's optional high->low schedule: a high lr early reaches a high peak
+    fast (the configs that hit 184.7 used lr~0.005), then decaying toward a low
+    lr keeps the policy from over-sharpening into the late collapse that a
+    constant high lr suffers. Only active when a species sets `lr_final`; with
+    just `lr` the rate is constant (the validated default)."""
+    return float(lr_start * (1.0 - frac) + lr_final * frac)
+
+
 def _adapt_entropy_beta(beta: float, entropy: float, target: float, floor: float) -> float:
     """One step of the adaptive entropy controller: nudge `beta` to drive the
     policy's measured `entropy` toward `target`. Multiplicative in log-space
@@ -549,6 +559,10 @@ def train(args: argparse.Namespace) -> None:
     if args.pred_lr is not None:
         SPECIES_TUNING[PREDATOR] = {**SPECIES_TUNING[PREDATOR], "lr": args.pred_lr}
         print(f"[pred-lr] predator learning rate overridden to {args.pred_lr}")
+    if args.pred_lr_final is not None:
+        SPECIES_TUNING[PREDATOR] = {**SPECIES_TUNING[PREDATOR], "lr_final": args.pred_lr_final}
+        lr_start = SPECIES_TUNING[PREDATOR].get("lr", train_cfg.lr)
+        print(f"[pred-lr] predator lr will decay {lr_start} -> {args.pred_lr_final} over the run")
 
     out_dir = Path(args.out_dir)
 
@@ -713,13 +727,20 @@ def train(args: argparse.Namespace) -> None:
             # their updates at epoch 1 every step. Other species use the
             # CLI default.
             sp_target_kl = tune.get("target_kl", args.target_kl if args.target_kl > 0 else None)
+            # Per-species learning rate, with optional linear high->low decay
+            # (only when `lr_final` is set; otherwise constant `lr`, or cfg.lr).
+            sp_lr = tune.get("lr")
+            lr_final = tune.get("lr_final")
+            if sp_lr is not None and lr_final is not None:
+                sp_lr = _decayed_lr(sp_lr, lr_final, frac)
             m = policies[sp].update_ppo(
                 obs, acts, old_log_probs, advantages, returns_target, train_cfg, sp_beta,
-                lr_override=tune.get("lr"),
+                lr_override=sp_lr,
                 ppo_clip_override=tune.get("ppo_clip"),
                 target_kl=sp_target_kl,
             )
             m["entropy_beta"] = float(sp_beta)
+            m["lr"] = float(sp_lr if sp_lr is not None else train_cfg.lr)
             # Steer the adaptive coefficient from the entropy this update
             # produced, ready for the next update.
             if entropy_target is not None and np.isfinite(m.get("entropy", float("nan"))):
@@ -847,6 +868,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=0.005)
     parser.add_argument("--pred-lr", type=float, default=None,
                         help="override the predator's learning rate (default from SPECIES_TUNING, 0.0025). The predator is the species that mode-collapses; a gentler lr slows the policy sharpening that drives it. Exposed for the per-seed LR sweep (run each seed at a different value and keep the best).")
+    parser.add_argument("--pred-lr-final", type=float, default=None,
+                        help="if set, the predator lr decays linearly from --pred-lr (start) to this value over the run. High start -> fast climb to a high peak; low end -> stability instead of the late collapse a constant high lr suffers. For peak-chasing: --pred-lr 0.005 --pred-lr-final 0.0015.")
     parser.add_argument("--clip", type=float, default=5.0)
     parser.add_argument("--entropy-beta", type=float, default=0.015)
     parser.add_argument("--entropy-final", type=float, default=0.005,
