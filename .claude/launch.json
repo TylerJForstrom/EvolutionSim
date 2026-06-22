@@ -3,9 +3,9 @@
   "configurations": [
     {
       "name": "ecosystem",
-      "runtimeExecutable": "python3",
-      "runtimeArgs": ["-m", "http.server", "8098"],
-      "port": 8098
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8123", "--directory", "web"],
+      "port": 8123
     }
   ]
 }

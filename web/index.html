@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#0a0e16" />
+    <title>Adaptive Ecosystem Lab — Coevolutionary RL</title>
+    <meta
+      name="description"
+      content="Five species learn to survive together with from-scratch multi-agent reinforcement learning — and the story of catching the training run collapse into NaNs and engineering the fix. Live demo."
+    />
+    <meta property="og:title" content="Adaptive Ecosystem Lab — Coevolutionary RL" />
+    <meta property="og:description" content="Watch five species learn to coexist — and how I diagnosed and fixed a training collapse." />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%230a0e16'/%3E%3Ccircle cx='5' cy='6' r='2' fill='%2334d399'/%3E%3Ccircle cx='11' cy='7' r='2' fill='%23f87171'/%3E%3Ccircle cx='8' cy='11.5' r='2' fill='%2322d3ee'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="demo.css" />
+  </head>
+  <body>
+    <div class="bg-grid" aria-hidden="true"></div>
+
+    <header class="top">
+      <a class="back" href="https://tylerforstrom.dev">← Tyler Forstrom</a>
+      <nav class="top-links">
+        <a href="https://github.com/TylerJForstrom/EvolutionSim" target="_blank" rel="noopener">Code ↗</a>
+      </nav>
+    </header>
+
+    <main>
+      <!-- HERO -->
+      <section class="hero">
+        <p class="eyebrow">Multi-agent reinforcement learning · from scratch</p>
+        <h1>Adaptive Ecosystem Lab</h1>
+        <p class="lede">
+          Five species — herbivores, predators, decomposers, pollinators, and
+          engineers — each learn their own policy network at the same time, in a
+          world that's adapting right back. No species is told what to do; they
+          discover how to forage, hunt, flee, and reproduce by trial and error.
+          Then the interesting part: the training run kept
+          <em>collapsing</em> — and fixing it was the real project.
+        </p>
+      </section>
+
+      <!-- SIM -->
+      <section class="block">
+        <div class="block-head">
+          <h2>1 · Watch the trained policies run</h2>
+          <p>
+            This is the actual learned behavior, recorded from the simulator.
+            Predators stalk and thin the herd; the population settles into a
+            coevolved balance. Flip to <strong>Untrained</strong> to see the same
+            world with random actions — the difference is the learning.
+          </p>
+        </div>
+
+        <div class="sim-wrap">
+          <div class="sim-stage">
+            <canvas id="eco" width="768" height="576" aria-label="Live ecosystem simulation"></canvas>
+            <div class="sim-tick"><span id="tickNow">0</span> / <span id="tickMax">600</span></div>
+          </div>
+
+          <div class="sim-side">
+            <div class="seg" role="group" aria-label="Policy">
+              <button id="modeTrained" class="seg-btn active" aria-pressed="true">Trained</button>
+              <button id="modeRandom" class="seg-btn" aria-pressed="false">Untrained</button>
+            </div>
+
+            <div class="legend" id="legend"><!-- filled by JS --></div>
+
+            <div class="controls">
+              <button id="playBtn" class="ctl-play" aria-label="Pause">❚❚</button>
+              <input id="scrub" class="scrub" type="range" min="0" max="599" value="0" aria-label="Scrub timeline" />
+            </div>
+            <div class="speed" role="group" aria-label="Speed">
+              <span class="speed-lbl">Speed</span>
+              <button class="spd" data-s="0.5">0.5×</button>
+              <button class="spd active" data-s="1">1×</button>
+              <button class="spd" data-s="2">2×</button>
+              <button class="spd" data-s="4">4×</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TRAINING STORY -->
+      <section class="block">
+        <div class="block-head">
+          <h2>2 · Watch it learn — then nearly die</h2>
+          <p>
+            Every dot is one training update's score (how healthy the whole
+            ecosystem is). The <span class="k k-bad">original run</span> climbs
+            to a strong <strong>194.8</strong>… then the predator policy quietly
+            collapses, nothing controls the herbivores, they overgraze, and the
+            whole food web <strong>craters into the negative</strong> — wasting
+            70% of the compute. The <span class="k k-good">fixed run</span>
+            stays alive the whole way.
+          </p>
+        </div>
+
+        <div class="chart-card">
+          <svg id="chart" viewBox="0 0 900 380" role="img" aria-label="Training score over time: original run collapses, fixed run stays stable"></svg>
+          <div class="chart-legend">
+            <span class="k k-bad">● Original run — collapses (NaNs by u≈3900)</span>
+            <span class="k k-good">● Fixed run — stable to 5000 updates</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- THE FIX -->
+      <section class="block">
+        <div class="block-head">
+          <h2>3 · What was actually broken</h2>
+          <p>I traced the collapse to three independent failures and fixed each one — structurally, not with band-aids:</p>
+        </div>
+        <div class="fix-grid">
+          <article class="fix">
+            <h3>Silent NaN corruption</h3>
+            <p>
+              A near-deterministic policy made the PPO probability ratio overflow
+              <code>float32</code> → <code>inf</code> → <code>NaN</code>, permanently
+              poisoning the weights. Clamping the log-ratio before <code>exp()</code>
+              fixed it in both the NumPy and PyTorch backends.
+            </p>
+          </article>
+          <article class="fix">
+            <h3>Population explosion</h3>
+            <p>
+              Herbivores spread across the whole map, so the per-cell breeding cap
+              never engaged and they ran to 67×. A global ecological
+              <em>carrying capacity</em> damps the runaway — verified to plateau
+              instead of boom-bust.
+            </p>
+          </article>
+          <article class="fix">
+            <h3>Predator policy collapse</h3>
+            <p>
+              The predator's sparse reward made it over-sharpen into a useless
+              deterministic policy. An adaptive entropy controller plus a decaying
+              learning rate kept it exploring — taking the run from
+              <em>always collapsing</em> to stable in most seeds.
+            </p>
+          </article>
+        </div>
+        <p class="footnote">
+          Built from scratch in NumPy + PyTorch: a vectorized 5-species ecosystem,
+          PPO with GAE, multi-seed evaluation, checkpoint/resume, and a regression
+          test suite. Trained on a GPU across five rounds of diagnosis and tuning.
+        </p>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <p>
+        Tyler Forstrom ·
+        <a href="https://github.com/TylerJForstrom/EvolutionSim" target="_blank" rel="noopener">EvolutionSim on GitHub</a>
+        · built with vanilla JS &amp; Canvas, no frameworks
+      </p>
+    </footer>
+
+    <script src="demo.js" defer></script>
+  </body>
+</html>
