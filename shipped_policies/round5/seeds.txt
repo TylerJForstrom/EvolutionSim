@@ -1,0 +1,5 @@
+run 1  seed=19150  hidden=192  out=models_seed_19150
+run 2  seed=26374  hidden=192  out=models_seed_26374
+run 3  seed=15307  hidden=192  out=models_seed_15307
+run 4  seed=31564  hidden=256  out=models_seed_31564
+run 5  seed=14971  hidden=256  out=models_seed_14971

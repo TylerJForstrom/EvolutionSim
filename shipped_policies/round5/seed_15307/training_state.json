@@ -1,0 +1,6 @@
+{
+  "update": 795,
+  "best_eval_score": 155.27870037417384,
+  "kind": "best",
+  "backend": "torch"
+}
