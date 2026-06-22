@@ -11,3 +11,6 @@ isolate-*.log
 bench/prof.txt
 bench/results_*.txt
 bench/baseline.sim.js
+
+# Local Netlify folder
+.netlify
